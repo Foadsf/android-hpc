@@ -85,7 +85,7 @@ if(_vk_possible AND NOT ANDROID)
   target_link_libraries(hpc_core PRIVATE Vulkan::Headers)
 endif()
 if(ANDROID)
-  target_link_libraries(hpc_core PRIVATE EGL GLESv3 android)
+  target_link_libraries(hpc_core PRIVATE EGL GLESv3 android log)  # log: __android_log_print in log.cpp
 endif()
 if(MSVC)
   target_compile_options(hpc_core PRIVATE /W3 /utf-8)

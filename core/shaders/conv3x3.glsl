@@ -1,5 +1,8 @@
 // 3x3 correlation over an image of P_M rows x P_N cols. Border pixels copy the input.
-layout(local_size_x = 16, local_size_y = 16) in;
+#ifndef WG2D
+#define WG2D 16
+#endif
+layout(local_size_x = WG2D, local_size_y = WG2D) in;
 layout(std430, binding = 0) readonly buffer BufA { float A[]; };
 layout(std430, binding = 1) readonly buffer BufB { float W[]; };
 layout(std430, binding = 2) writeonly buffer BufC { float C[]; };

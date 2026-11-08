@@ -101,7 +101,7 @@ via OpenCL 462 GFLOP/s; NVIDIA triad ~163 GB/s. Phones will look very different.
 | Component | Status | How |
 |---|---|---|
 | CPU, SYCL-shim | **Run and verified** | `hpc_tests` on x86-64 (MSVC); also on an arm64 phone (8 cores, NEON), 0.1.1 log of 2026-11-08, all results matched the fp64 reference |
-| Vulkan and OpenCL on a phone GPU | **Run and verified on one device** | Arm Mali-G71 (Vulkan 1.0.97, OpenCL 2.0 "ARM Platform"), 0.1.1 log of 2026-11-08: sgemm, conv3x3, reduce, triad and dense matched the reference (device-reported GPU; the phone model is not in the partial log) |
+| Vulkan and OpenCL on a phone GPU | **Run and verified on two devices** | Arm Mali-G71 (Vulkan 1.0.97, OpenCL 2.0) and Arm Mali-G76 (Vulkan 1.1.177, OpenCL 3.0), 0.1.1 logs of 2026-11-08: sgemm, conv3x3, reduce, triad and dense matched the reference on both (GPUs as the drivers report them; the phone models are not in the partial logs) |
 | Vulkan (unified-memory path) | **Run and verified** | Intel UHD (integrated) on Windows |
 | Vulkan (discrete/staged path) | **Run and verified** | NVIDIA RTX A2000 on Windows |
 | Vulkan (third driver stack) | **Run and verified in CI** | Mesa llvmpipe (software Vulkan 1.4) on a GitHub Linux runner |
@@ -111,9 +111,9 @@ via OpenCL 462 GFLOP/s; NVIDIA triad ~163 GB/s. Phones will look very different.
 | Odd sizes / bounds | **Verified** | 7, 33, 61, 77, 1001, 100003 and a non-square 65x77x77 slice on every available backend |
 | APK build | **Built, signature, 16 KB alignment, manifest checked** | `apksigner`, `zipalign -P 16`, `aapt2 dump badging` |
 | Android runtime (JNI, UI) | **0.1.0 crashed on launch on the first real phone; 0.1.1 ran two full 22-result benchmark runs without a crash, all verified** | the 0.1.0 crash cause was never captured (no log existed), so which of the 0.1.1 fixes cured it is unknown. The 0.1.1 log was shared in part (the start of the first run is missing) |
-| OpenGL ES backend | **Probed on a phone, not benchmarked** | EGL 1.4 and an ES 3.2 context were created on the Mali-G71, but the backend reported `available=0` by design: it requires at least 256 invocations per workgroup and this driver reports 128 (OpenCL and Vulkan on the same GPU report 384). The GLES kernels have therefore never run |
-| NNAPI backend | **Run and verified on one device, CPU reference driver only** | the only NNAPI device was `nnapi-reference` (a CPU implementation), so no accelerator was exercised; dense matched the reference |
-| Vulkan `AHardwareBuffer` import | **Compiles; NOT yet run, off by default** | falls back to a copy and records why if the import fails |
+| OpenGL ES backend | **Results verified on the Mali-G76 (0.1.1); workgroup fix for the Mali-G71 in 0.1.2 not yet run** | on the G76 (384 invocations) all kernels matched the reference, but the GL timer query returned an implausible ~190 ns, giving absurd GFLOP/s; 0.1.2 discards timer values under 1 us and uses wall-clock. The Mali-G71 reports 128 invocations, so 0.1.1 marked GLES unavailable there; 0.1.2 picks 8x8 / 64-wide workgroups from the driver limit (built and SPIR-V-checked at those sizes, GLES text not executed on the host) |
+| NNAPI backend | **Run and verified on two devices** | Mali-G71 phone: only `nnapi-reference` (CPU). Mali-G76 phone: `eden-drv` (an accelerator) plus `nnapi-reference`; dense matched the reference on all of them |
+| Vulkan `AHardwareBuffer` import | **Succeeded on the Mali-G76 (Vulkan 1.1); fell back to copy on the Mali-G71 (Vulkan 1.0.97)** | on the G71 the reason was not logged in 0.1.1; 0.1.2 logs it. Experimental |
 | SysML model | **Hand-checked, NOT machine-parsed** | validate with SysIDE or the OMG pilot implementation |
 | CI | runs on GitHub Actions | Linux: software Vulkan (lavapipe) + software OpenCL (PoCL); APK build |
 

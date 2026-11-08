@@ -147,6 +147,36 @@ struct TimerFns {
   bool ok() const { return gen && del && begin && end && getObj; }
 };
 
+// Workgroup shapes chosen from the driver's GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS. ES 3.1 only
+// guarantees 128, and the Arm Mali-G71 reports exactly 128, so the 16x16 / 256 defaults of the
+// shared shader bodies cannot be assumed. Both values are powers of two.
+struct WgShape { uint32_t wg1d = 256; uint32_t wg2d = 16; };
+
+uint32_t floorPow2(uint32_t v) {
+  uint32_t p = 1;
+  while (p * 2 <= v) p *= 2;
+  return p;
+}
+
+WgShape chooseWgShape(int maxInvocations) {
+  WgShape s;
+  const uint32_t inv = maxInvocations > 0 ? uint32_t(maxInvocations) : 1u;
+  s.wg1d = std::min<uint32_t>(256u, floorPow2(inv));
+  uint32_t edge = std::min<uint32_t>(16u, floorPow2(inv));
+  while (edge > 1 && edge * edge > inv) edge /= 2;
+  s.wg2d = edge;
+  return s;
+}
+
+// "#version" must stay the first line, so the defines are spliced in after it.
+std::string withWorkgroup(const char* src, const WgShape& w) {
+  std::string s(src);
+  const size_t nl = s.find('\n');
+  const std::string defs = "#define WG1D " + std::to_string(w.wg1d) + "\n#define WG2D " + std::to_string(w.wg2d) + "\n";
+  s.insert(nl == std::string::npos ? s.size() : nl + 1, defs);
+  return s;
+}
+
 GLuint compileProgram(const char* src, std::string* err) {
   GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
   glShaderSource(sh, 1, &src, nullptr);
@@ -182,7 +212,7 @@ GLuint compileProgram(const char* src, std::string* err) {
 
 class GlExecution final : public Execution {
  public:
-  GlExecution(std::shared_ptr<EglCtx> c, TimerFns t) : c_(std::move(c)), tf_(t) {}
+  GlExecution(std::shared_ptr<EglCtx> c, TimerFns t, WgShape w) : c_(std::move(c)), tf_(t), wg_(w) {}
   ~GlExecution() override {
     if (!c_->makeCurrent()) return;
     GLuint bufs[] = {a_, b_, bias_, partial_, out_, dummy_};
@@ -214,21 +244,21 @@ class GlExecution final : public Execution {
         b_ = makeBuf(p.b.data(), size_t(p.k) * p.n * F);
         if (p.kernel == Kernel::Dense) bias_ = makeBuf(p.bias.data(), size_t(p.n) * F);
         out_ = makeBuf(nullptr, outCount_ * F);
-        gx_ = (p.n + 15) / 16; gy_ = (p.m + 15) / 16;
+        gx_ = (p.n + wg_.wg2d - 1) / wg_.wg2d; gy_ = (p.m + wg_.wg2d - 1) / wg_.wg2d;
         break;
       case Kernel::Conv3x3:
         src = kEs_conv3x3;
         a_ = makeBuf(p.a.data(), size_t(p.m) * p.n * F);
         b_ = makeBuf(p.b.data(), 9 * F);
         out_ = makeBuf(nullptr, outCount_ * F);
-        gx_ = (p.n + 15) / 16; gy_ = (p.m + 15) / 16;
+        gx_ = (p.n + wg_.wg2d - 1) / wg_.wg2d; gy_ = (p.m + wg_.wg2d - 1) / wg_.wg2d;
         break;
       case Kernel::Reduce:
         src = kEs_reduce;
         a_ = makeBuf(p.a.data(), size_t(p.n) * F);
         partial_ = makeBuf(nullptr, kGroups * F);
         out_ = makeBuf(nullptr, F);
-        groups_ = std::min<uint32_t>(kGroups, std::max<uint32_t>(1, (p.n + 255) / 256));
+        groups_ = std::min<uint32_t>(kGroups, std::max<uint32_t>(1, (p.n + wg_.wg1d - 1) / wg_.wg1d));
         gx_ = groups_; gy_ = 1;
         break;
       case Kernel::Triad:
@@ -236,11 +266,13 @@ class GlExecution final : public Execution {
         a_ = makeBuf(p.a.data(), size_t(p.n) * F);
         b_ = makeBuf(p.b.data(), size_t(p.n) * F);
         out_ = makeBuf(nullptr, size_t(p.n) * F);
-        gx_ = std::min<uint32_t>(8192, std::max<uint32_t>(1, (p.n + 255) / 256)); gy_ = 1;
+        gx_ = std::min<uint32_t>(8192, std::max<uint32_t>(1, (p.n + wg_.wg1d - 1) / wg_.wg1d)); gy_ = 1;
         break;
     }
     glFinish();
-    prog_ = compileProgram(src, err);
+    const std::string shaderText = withWorkgroup(src, wg_);
+    HPC_LOGV("[GLES] workgroup shape: 1D=%u 2D=%ux%u", unsigned(wg_.wg1d), unsigned(wg_.wg2d), unsigned(wg_.wg2d));
+    prog_ = compileProgram(shaderText.c_str(), err);
     if (!prog_) return false;
     uM_ = glGetUniformLocation(prog_, "u_m");
     uK_ = glGetUniformLocation(prog_, "u_k");
@@ -295,7 +327,15 @@ class GlExecution final : public Execution {
       glGetIntegerv(GL_GPU_DISJOINT_EXT, &dis);
       GLuint64 ns = 0;
       tf_.getObj(query_, GL_QUERY_RESULT_EXT, &ns);
-      if (!dis && deviceMs) *deviceMs = double(ns) * 1e-6;
+      // A real dispatch cannot take under 1 microsecond. The Mali-G76 driver returned
+      // ~190 ns for a 256^3 sgemm (about 175 TFLOP/s on a phone), so such values are
+      // discarded and the report falls back to wall-clock time.
+      constexpr GLuint64 kMinPlausibleNs = 1000;
+      if (!dis && ns >= kMinPlausibleNs) {
+        if (deviceMs) *deviceMs = double(ns) * 1e-6;
+      } else if (!dis) {
+        HPC_LOGV("[GLES] timer query returned an implausible %llu ns; using wall-clock time", (unsigned long long)ns);
+      }
     }
     return true;
   }
@@ -315,6 +355,7 @@ class GlExecution final : public Execution {
   static constexpr uint32_t kGroups = 256;
   std::shared_ptr<EglCtx> c_;
   TimerFns tf_;
+  WgShape wg_;
   const Problem* p_ = nullptr;
   size_t outCount_ = 0;
   GLuint a_ = 0, b_ = 0, bias_ = 0, partial_ = 0, out_ = 0, dummy_ = 0, prog_ = 0, query_ = 0;
@@ -324,7 +365,8 @@ class GlExecution final : public Execution {
 
 class GlesBackend final : public Backend {
  public:
-  GlesBackend(std::shared_ptr<EglCtx> c, TimerFns t, BackendInfo info) : c_(std::move(c)), tf_(t), info_(std::move(info)) {}
+  GlesBackend(std::shared_ptr<EglCtx> c, TimerFns t, WgShape w, BackendInfo info)
+      : c_(std::move(c)), tf_(t), wg_(w), info_(std::move(info)) {}
   ~GlesBackend() override {
     if (c_) c_->destroyObjects();
   }
@@ -334,7 +376,7 @@ class GlesBackend final : public Backend {
       if (err) *err = c_->error.empty() ? "eglMakeCurrent failed" : c_->error;
       return nullptr;
     }
-    std::unique_ptr<GlExecution> e(new GlExecution(c_, tf_));
+    std::unique_ptr<GlExecution> e(new GlExecution(c_, tf_, wg_));
     if (!e->build(p, err)) return nullptr;
     return e;
   }
@@ -342,6 +384,7 @@ class GlesBackend final : public Backend {
  private:
   std::shared_ptr<EglCtx> c_;
   TimerFns tf_;
+  WgShape wg_;
   BackendInfo info_;
 };
 
@@ -394,14 +437,18 @@ void discoverGles(std::vector<std::unique_ptr<Backend>>& out) {
   info.detail["gpu_timer_query"] = tf.ok() ? "GL_EXT_disjoint_timer_query" : "unavailable (wall-clock only)";
   info.detail["zero_copy"] = "not implemented for GLES";
   info.kernels.assign(std::begin(kAllKernels), std::end(kAllKernels));
-  info.available = inv >= 256 && shm >= 4096;
-  if (!info.available) info.note = "needs >= 256 invocations per workgroup (limit " + std::to_string(inv) + ")";
+  const WgShape wg = chooseWgShape(inv);
+  info.detail["workgroup_1d"] = std::to_string(wg.wg1d);
+  info.detail["workgroup_2d"] = std::to_string(wg.wg2d) + "x" + std::to_string(wg.wg2d);
+  // The smallest shape the shaders support is 8x8 / 64; ES 3.1 guarantees 128 invocations.
+  info.available = wg.wg1d >= 64 && wg.wg2d >= 8 && shm >= 4096;
+  if (!info.available) info.note = "needs >= 64 invocations per workgroup and 4 KiB shared memory (limits " + std::to_string(inv) + " / " + std::to_string(shm) + ")";
   // Tear down the probe context/pbuffer now (without eglTerminate); GlesBackend will
   // lazily create a fresh context/surface in prepare() only if a kernel is actually run.
   c->destroyObjects();
-  HPC_LOGI("[GLES] discover complete: available=%d maxInv=%d sharedMem=%d timerQuery=%d",
-           info.available ? 1 : 0, int(inv), int(shm), tf.ok() ? 1 : 0);
-  out.emplace_back(new GlesBackend(c, tf, info));
+  HPC_LOGI("[GLES] discover complete: available=%d maxInv=%d sharedMem=%d timerQuery=%d wg1d=%u wg2d=%u",
+           info.available ? 1 : 0, int(inv), int(shm), tf.ok() ? 1 : 0, unsigned(wg.wg1d), unsigned(wg.wg2d));
+  out.emplace_back(new GlesBackend(c, tf, wg, info));
 }
 
 }  // namespace hpc

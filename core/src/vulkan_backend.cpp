@@ -653,6 +653,11 @@ class VkExecution final : public Execution {
         if (!zcB) { g.destroy(b_); if (zcNote_.empty()) zcNote_ = e; }
       }
       zeroCopy_ = zcA && (!needB || zcB);
+      if (!zeroCopy_) {
+        // Previously only stored in the report detail, so a device log never said why.
+        HPC_LOGI("[VK] zero-copy AHardwareBuffer import not used, falling back to copy: %s",
+                 zcNote_.empty() ? "(no reason reported)" : zcNote_.c_str());
+      }
     }
     if (!zcA) { if (!make(a_, aBytes) || !g.upload(a_, aData, aBytes, err)) return false; }
     if (needB && !zcB) { if (!make(b_, bBytes) || !g.upload(b_, bData, bBytes, err)) return false; }
