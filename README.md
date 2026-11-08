@@ -100,7 +100,8 @@ via OpenCL 462 GFLOP/s; NVIDIA triad ~163 GB/s. Phones will look very different.
 
 | Component | Status | How |
 |---|---|---|
-| CPU, SYCL-shim | **Run and verified** | `hpc_tests` on x86-64 (MSVC); same code compiled for arm64 and x86_64 Android, not yet run there |
+| CPU, SYCL-shim | **Run and verified** | `hpc_tests` on x86-64 (MSVC); also on an arm64 phone (8 cores, NEON), 0.1.1 log of 2026-11-08, all results matched the fp64 reference |
+| Vulkan and OpenCL on a phone GPU | **Run and verified on one device** | Arm Mali-G71 (Vulkan 1.0.97, OpenCL 2.0 "ARM Platform"), 0.1.1 log of 2026-11-08: sgemm, conv3x3, reduce, triad and dense matched the reference (device-reported GPU; the phone model is not in the partial log) |
 | Vulkan (unified-memory path) | **Run and verified** | Intel UHD (integrated) on Windows |
 | Vulkan (discrete/staged path) | **Run and verified** | NVIDIA RTX A2000 on Windows |
 | Vulkan (third driver stack) | **Run and verified in CI** | Mesa llvmpipe (software Vulkan 1.4) on a GitHub Linux runner |
@@ -109,9 +110,9 @@ via OpenCL 462 GFLOP/s; NVIDIA triad ~163 GB/s. Phones will look very different.
 | Verifier | **Negative-controlled** | corrupt element, NaN and wrong length are rejected |
 | Odd sizes / bounds | **Verified** | 7, 33, 61, 77, 1001, 100003 and a non-square 65x77x77 slice on every available backend |
 | APK build | **Built, signature, 16 KB alignment, manifest checked** | `apksigner`, `zipalign -P 16`, `aapt2 dump badging` |
-| Android runtime (JNI, UI) | **0.1.0 crashed on launch on the first real phone; 0.1.1 adds fixes and logging; NOT yet re-verified** | the cause is unconfirmed: no crash log existed. 0.1.1 fixes the most likely causes found by static review (see Debugging a crash) and writes a log that will show the real one |
-| OpenGL ES backend | **Compiles for arm64/x86_64; NOT yet run** | headless EGL cannot run on the Windows host |
-| NNAPI backend | **Compiles; constants checked against NDK r26 headers; NOT yet run** | |
+| Android runtime (JNI, UI) | **0.1.0 crashed on launch on the first real phone; 0.1.1 ran two full 22-result benchmark runs without a crash, all verified** | the 0.1.0 crash cause was never captured (no log existed), so which of the 0.1.1 fixes cured it is unknown. The 0.1.1 log was shared in part (the start of the first run is missing) |
+| OpenGL ES backend | **Probed on a phone, not benchmarked** | EGL 1.4 and an ES 3.2 context were created on the Mali-G71, but the backend reported `available=0` by design: it requires at least 256 invocations per workgroup and this driver reports 128 (OpenCL and Vulkan on the same GPU report 384). The GLES kernels have therefore never run |
+| NNAPI backend | **Run and verified on one device, CPU reference driver only** | the only NNAPI device was `nnapi-reference` (a CPU implementation), so no accelerator was exercised; dense matched the reference |
 | Vulkan `AHardwareBuffer` import | **Compiles; NOT yet run, off by default** | falls back to a copy and records why if the import fails |
 | SysML model | **Hand-checked, NOT machine-parsed** | validate with SysIDE or the OMG pilot implementation |
 | CI | runs on GitHub Actions | Linux: software Vulkan (lavapipe) + software OpenCL (PoCL); APK build |
