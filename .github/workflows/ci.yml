@@ -43,6 +43,13 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
+      - name: Fetch the Gradle distribution (retry: services.gradle.org returns 504 at times)
+        run: |
+          for i in 1 2 3 4 5 6; do
+            ./gradlew --no-daemon --version && exit 0
+            echo "attempt $i failed; retrying in $((i*20))s"; sleep $((i*20))
+          done
+          exit 1
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
       - name: Verify the APK declares what it must
