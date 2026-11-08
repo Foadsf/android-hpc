@@ -103,7 +103,8 @@ via OpenCL 462 GFLOP/s; NVIDIA triad ~163 GB/s. Phones will look very different.
 | CPU, SYCL-shim | **Run and verified** | `hpc_tests` on x86-64 (MSVC); same code compiled for arm64 and x86_64 Android, not yet run there |
 | Vulkan (unified-memory path) | **Run and verified** | Intel UHD (integrated) on Windows |
 | Vulkan (discrete/staged path) | **Run and verified** | NVIDIA RTX A2000 on Windows |
-| OpenCL | **Run and verified** | Intel and NVIDIA ICDs on Windows |
+| Vulkan (third driver stack) | **Run and verified in CI** | Mesa llvmpipe (software Vulkan 1.4) on a GitHub Linux runner |
+| OpenCL | **Run and verified** | Intel and NVIDIA ICDs on Windows; PoCL (CPU) in Linux CI |
 | SPIR-V | **Validated** | `spirv-val --target-env vulkan1.0`, one ctest per shader |
 | Verifier | **Negative-controlled** | corrupt element, NaN and wrong length are rejected |
 | Odd sizes / bounds | **Verified** | 7, 33, 61, 77, 1001, 100003 and a non-square 65x77x77 slice on every available backend |
