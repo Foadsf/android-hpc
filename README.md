@@ -1,0 +1,146 @@
+# android-hpc
+
+An open-source proof of concept for **heterogeneous high-performance computing on Android**: one
+benchmark suite, five kernels, run on the CPU, Vulkan compute (SPIR-V), OpenCL, OpenGL ES 3.1
+compute and NNAPI, with every result checked against an fp64 CPU reference. It ships as an APK and
+as a command-line tool (host PC or `adb shell`), plus a SysML v2 model of the requirements and
+architecture.
+
+It started from a Grok-generated SysML v2 model and a long Gemini audit of it. Both were
+fact-checked and then re-implemented from scratch; see [docs/FACT_CHECK.md](docs/FACT_CHECK.md).
+
+> **Read this first.** This is a measurement and teaching tool, not a tuned library. The kernels
+> are straightforward tiled implementations and do **not** reach hardware peak. The project's claim
+> is that what it reports is *real and verified*, not that it is fast. Several backends have been
+> built but not yet run on an Android device; the table below says exactly which.
+
+## What is in it
+
+| Backend | How it works | Kernels | Notes |
+|---|---|---|---|
+| `cpu` | C++17 persistent thread pool, dynamic scheduling, packed-panel register-tiled GEMM, auto-vectorised | all 5 | pins workers only on heterogeneous (big.LITTLE) CPUs |
+| `vulkan:N` | one backend per Vulkan device; SPIR-V built from GLSL at build time with `glslc`; GPU timestamp queries | all 5 | unified-memory GPUs use host-visible memory directly, discrete GPUs use staging; optional experimental `AHardwareBuffer` import |
+| `opencl:N` | runtime `dlopen` of the vendor ICD (OpenCL is not an NDK API); event profiling | all 5 | needs `<uses-native-library>` on Android 12+, declared in the manifest |
+| `gles` | OpenGL ES 3.1 compute shaders over a headless EGL pbuffer | all 5 | Android only; uses `GL_EXT_disjoint_timer_query` when present |
+| `nnapi:N` | one NNAPI `FULLY_CONNECTED` op per NNAPI device, via `dlopen` | `dense` | NNAPI is deprecated since Android 15; a device called `nnapi-reference` is a CPU, not an NPU, and is labelled so |
+| `sycl-shim` | SYCL-shaped API on the CPU thread pool | all 5 | **Not SYCL.** Marked `genuine=false` in every report. Real SYCL is not packaged for Android |
+
+Kernels: `sgemm` (compute-bound), `dense` (GEMM + bias + ReLU, one NN layer), `conv3x3`, `reduce`
+(two-pass multi-workgroup sum), `triad` (STREAM, bandwidth-bound).
+
+Also: a **CPU + GPU split** experiment (rows of one SGEMM run concurrently on both, output verified),
+CPU topology/ISA probing, per-device capability probes (memory model, subgroup size, fp64 support,
+workgroup limits), and JSON + text reports with min/median/mean/p95/stddev for wall time and, where
+the API provides it, on-device time.
+
+## Get the APK
+
+A debug-signed APK is built by CI on every push (Actions artifact `android-hpc-debug-apk`) and the
+build below produces it locally at `app/build/outputs/apk/debug/app-debug.apk`.
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Or copy the file to the phone and open it (allow "install unknown apps" for your file manager).
+Open **Android HPC**, pick a preset, press **Run**. Use **Save JSON** (written to
+`/sdcard/Android/data/org.androidhpc.bench/files/`, fetch with `adb pull`) or **Share**.
+
+arm64-v8a is the real target; x86_64 is included for emulators.
+
+## Build
+
+Requirements: JDK 17, Android SDK platform 35 + build-tools 35, **NDK 26.1.10909125**, CMake 3.22.1.
+Gradle is provided by the wrapper.
+
+```bash
+./gradlew assembleDebug              # APK (Windows: gradlew.bat)
+```
+
+Command-line tool for Android (`adb shell`), PowerShell:
+
+```powershell
+.\scripts\build-android-cli.ps1 -Abi arm64-v8a
+adb push dist\hpc_cli-arm64-v8a /data/local/tmp/hpc_cli
+adb shell chmod +x /data/local/tmp/hpc_cli
+adb shell /data/local/tmp/hpc_cli --preset small --json /data/local/tmp/out.json
+```
+
+Host build (Windows/Linux). It runs the CPU backend plus whatever Vulkan and OpenCL devices the
+machine has, which is the fastest way to test the code. Needs a C++17 compiler, CMake, the Vulkan
+headers and `glslc` (the Vulkan SDK includes both):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+build/core/hpc_cli --preset medium --json report.json     # .../Release/hpc_cli.exe with MSVC
+```
+
+`hpc_cli --help` lists options. Exit status 0 means every attempted run matched the fp64 reference.
+
+## How to read a report
+
+* `wall ms`: host-measured time of one blocking run, including launch and sync.
+* `dev ms`: GPU-side time (Vulkan timestamps, OpenCL events, GL timer query) when available, else `-`.
+* `GFLOP/s`, `GB/s`: use device time if available, otherwise wall time. `GB/s` counts compulsory
+  traffic only, so it understates real traffic for the tiled kernels; treat it as meaningful for
+  `triad` and `reduce` only.
+* `ok`: the result matched the fp64 oracle within a per-kernel tolerance. A failed or mismatching run
+  makes the CLI exit non-zero.
+* Pipeline compilation and uploads happen in `prepare()` and are never inside a timed region.
+* Energy is **not** measured.
+
+A real example (Windows host, Intel UHD + NVIDIA RTX A2000, `--preset medium`) is in
+[docs/example-report-windows-host.json](docs/example-report-windows-host.json).
+Excerpt (sgemm 512³): CPU 27.8, Intel iGPU via Vulkan 67, via OpenCL 68, NVIDIA via Vulkan 481,
+via OpenCL 462 GFLOP/s; NVIDIA triad ~163 GB/s. Phones will look very different.
+
+## Verification status
+
+| Component | Status | How |
+|---|---|---|
+| CPU, SYCL-shim | **Run and verified** | `hpc_tests` on x86-64 (MSVC); same code compiled for arm64 and x86_64 Android, not yet run there |
+| Vulkan (unified-memory path) | **Run and verified** | Intel UHD (integrated) on Windows |
+| Vulkan (discrete/staged path) | **Run and verified** | NVIDIA RTX A2000 on Windows |
+| OpenCL | **Run and verified** | Intel and NVIDIA ICDs on Windows |
+| SPIR-V | **Validated** | `spirv-val --target-env vulkan1.0`, one ctest per shader |
+| Verifier | **Negative-controlled** | corrupt element, NaN and wrong length are rejected |
+| Odd sizes / bounds | **Verified** | 7, 33, 61, 77, 1001, 100003 and a non-square 65x77x77 slice on every available backend |
+| APK build | **Built, signature, 16 KB alignment, manifest checked** | `apksigner`, `zipalign -P 16`, `aapt2 dump badging` |
+| Android runtime (JNI, UI) | **NOT yet run on a device** | no device or emulator was available to the author |
+| OpenGL ES backend | **Compiles for arm64/x86_64; NOT yet run** | headless EGL cannot run on the Windows host |
+| NNAPI backend | **Compiles; constants checked against NDK r26 headers; NOT yet run** | |
+| Vulkan `AHardwareBuffer` import | **Compiles; NOT yet run, off by default** | falls back to a copy and records why if the import fails |
+| SysML model | **Hand-checked, NOT machine-parsed** | validate with SysIDE or the OMG pilot implementation |
+| CI | runs on GitHub Actions | Linux: software Vulkan (lavapipe) + software OpenCL (PoCL); APK build |
+
+If you run it on a phone, please open an issue with the saved JSON. A single report from a device
+turns a "not yet run" row into evidence.
+
+## Layout
+
+```
+core/            portable C++17 library (backends, harness, reference oracle), hpc_cli, tests
+core/shaders/    GLSL kernel bodies shared by Vulkan (SPIR-V) and GLES (ES 3.1 text)
+jni/, app/       JNI bridge and the single-activity Java app (no AndroidX)
+model/           SysML v2 model: requirements, architecture, allocation, verification
+docs/            FACT_CHECK.md, ARCHITECTURE.md, an example report
+scripts/         Android CLI build script
+```
+
+Adding a backend: implement `hpc::Backend` and `hpc::Execution` (`core/include/hpc/backend.hpp`),
+add a `discoverX()` call in `core/src/discover.cpp`. Adding a kernel: a `Problem` case, an oracle in
+`reference.cpp`, and a kernel per backend.
+
+## Known limitations
+
+* CPU kernels are portable C++, not hand-tuned NEON/SVE; GPU kernels are classic 16x16 tiling.
+* One GPU queue, one workgroup shape; no subgroup, fp16/int8 or cooperative-matrix paths yet.
+* The CPU+GPU split uses a throughput-proportional static partition measured from earlier runs.
+* No energy or thermal measurement. Sustained-load throttling is visible only as run-to-run drift.
+* Vulkan targets SPIR-V 1.0 / Vulkan 1.0 for compatibility, which forgoes newer features.
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE). Contributions are accepted under the same license.

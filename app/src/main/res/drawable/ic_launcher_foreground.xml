@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- a 3x3 grid of compute cells -->
+    <path android:fillColor="#4FC3F7" android:pathData="M34,34h10v10h-10z" />
+    <path android:fillColor="#4FC3F7" android:pathData="M49,34h10v10h-10z" />
+    <path android:fillColor="#4FC3F7" android:pathData="M64,34h10v10h-10z" />
+    <path android:fillColor="#4FC3F7" android:pathData="M34,49h10v10h-10z" />
+    <path android:fillColor="#FFB74D" android:pathData="M49,49h10v10h-10z" />
+    <path android:fillColor="#4FC3F7" android:pathData="M64,49h10v10h-10z" />
+    <path android:fillColor="#4FC3F7" android:pathData="M34,64h10v10h-10z" />
+    <path android:fillColor="#4FC3F7" android:pathData="M49,64h10v10h-10z" />
+    <path android:fillColor="#4FC3F7" android:pathData="M64,64h10v10h-10z" />
+</vector>

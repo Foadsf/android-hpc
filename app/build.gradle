@@ -1,0 +1,50 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'org.androidhpc.bench'
+    compileSdk 35
+    ndkVersion '26.1.10909125'
+
+    defaultConfig {
+        applicationId 'org.androidhpc.bench'
+        minSdk 26            // AHardwareBuffer NDK API; Vulkan/GLES/EGL are older
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+
+        ndk {
+            // arm64 is the real target; x86_64 lets the app run on emulators/Chromebooks.
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static', '-DHPC_BUILD_CLI=OFF'
+                targets 'hpcjni'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Unsigned by default. Sign with your own key for distribution; see README.
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    lint {
+        abortOnError false
+    }
+}

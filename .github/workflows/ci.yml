@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host-linux:
+    # Builds the portable core and runs the test-suite against software Vulkan (Mesa lavapipe)
+    # and software OpenCL (PoCL), so the Vulkan/OpenCL code paths run for real in CI.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain and software GPU drivers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build glslc libvulkan-dev spirv-tools \
+            mesa-vulkan-drivers vulkan-tools pocl-opencl-icd ocl-icd-libopencl1
+          vulkaninfo --summary | head -n 20 || true
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test (every available backend must match the fp64 reference)
+        run: ctest --test-dir build --output-on-failure
+      - name: Smoke benchmark
+        run: ./build/core/hpc_cli --preset small --iters 3 --json build/small.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-linux-report
+          path: build/small.json
+
+  android-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install pinned NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+      - name: Verify the APK declares what it must
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging app/build/outputs/apk/debug/app-debug.apk | tee badging.txt
+          grep -q "uses-native-library-not-required:'libOpenCL.so'" badging.txt
+          grep -q "native-code: 'arm64-v8a'" badging.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-hpc-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
