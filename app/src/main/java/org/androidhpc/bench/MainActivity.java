@@ -148,7 +148,13 @@ public class MainActivity extends Activity {
             TextView cbTitle = new TextView(this);
             cbTitle.setTypeface(Typeface.DEFAULT_BOLD);
             cbTitle.setTextSize(11.5f);
-            cbTitle.setText("Previous run did not exit cleanly");
+            // A last breadcrumb ending in ":begin" means a driver step never finished: a real
+            // crash or kill mid-step. Otherwise the app was most likely just swiped away from
+            // Recents while idle (Android kills it without running onDestroy).
+            final boolean midStep = cr.lastBreadcrumb != null && cr.lastBreadcrumb.endsWith(":begin");
+            cbTitle.setText(midStep
+                    ? "Previous run stopped in the middle of a driver step"
+                    : "Previous session was closed without a clean exit (no driver step was in progress)");
             crashBanner.addView(cbTitle);
 
             TextView cbBody = new TextView(this);
@@ -387,7 +393,7 @@ public class MainActivity extends Activity {
                 + "\n\n" + debugLog.readCurrentLogContent();
         DebugLog.CrashReport cr = debugLog.getCrashReport();
         if (cr != null) {
-            logText += "\n\n=== PREVIOUS UNCLEAN SESSION (" + cr.previousLogPath + ") ===\n"
+            logText += "\n\n=== PREVIOUS SESSION WITHOUT CLEAN EXIT (" + cr.previousLogPath + ") ===\n"
                     + "Breadcrumb: " + cr.lastBreadcrumb + "\n" + cr.tailLines;
         }
         Intent i = new Intent(Intent.ACTION_SEND);
