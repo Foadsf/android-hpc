@@ -241,16 +241,27 @@ class Gpu {
     v.resize(std::min<size_t>(n, v.size()));
     for (auto& e : v) {
       e.extensionName[sizeof(e.extensionName) - 1] = '\0';
-      s.insert(sanitizeAscii(e.extensionName));
+      s.insert(sanitizeAscii(e.extensionName, 256));
     }
+    HPC_LOGV("[VK] enumerated %zu device extensions for pd=%p", s.size(), static_cast<void*>(pd));
     return s;
   }
 
   bool init(std::string* err) {
     if (dev) return true;
+    if (!pd) {
+      if (err) *err = "null VkPhysicalDevice";
+      return false;
+    }
     auto& f = rt->f;
     uint32_t nq = 0;
     f.vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, nullptr);
+    if (nq == 0) {
+      if (err) *err = "device reports 0 queue families";
+      HPC_LOGW("[VK] device reports 0 queue families");
+      return false;
+    }
+    if (nq > 64) nq = 64;
     std::vector<VkQueueFamilyProperties> qs(nq);
     f.vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qs.data());
     qfi = UINT32_MAX;

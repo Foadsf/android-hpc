@@ -137,19 +137,19 @@ package AndroidHPC {
             action discover : DiscoverBackends;
             action prepare : PrepareExecution;      // pipeline build + upload: never inside a timed region
             action run : RunTimed;
-            action verify : VerifyAgainstOracle;
+            action verifyResult : VerifyAgainstOracle;
             action report : ReportJsonAndText;
 
             bind prepare.problem = problem;
             bind run.problem = problem;
-            flow from run.result to verify.result;
+            flow from run.result to verifyResult.result;
             flow from run.result to report.result;
 
             first start;
             then discover;
             then prepare;
             then run;
-            then verify;
+            then verifyResult;
             then report;
             then done;
         }
@@ -183,22 +183,22 @@ package AndroidHPC {
             attribute genuine : Boolean = true;   // false for stand-ins (sycl-shim)
             attribute available : Boolean;        // probed at run time
         }
-        part def CpuBackend : ComputeBackend {
+        part def CpuBackend :> ComputeBackend {
             doc /* Persistent thread pool, dynamic scheduling, optional core pinning. */
         }
-        part def VulkanBackend : ComputeBackend {
+        part def VulkanBackend :> ComputeBackend {
             doc /* SPIR-V from shared GLSL (glslc at build time), GPU timestamps, two-pass reduction. */
         }
-        part def OpenClBackend : ComputeBackend {
+        part def OpenClBackend :> ComputeBackend {
             doc /* Runtime dlopen of the vendor ICD; event profiling. Not an NDK API. */
         }
-        part def GlesBackend : ComputeBackend {
+        part def GlesBackend :> ComputeBackend {
             doc /* OpenGL ES 3.1 compute over a headless EGL pbuffer context. */
         }
-        part def NnapiBackend : ComputeBackend {
+        part def NnapiBackend :> ComputeBackend {
             doc /* FULLY_CONNECTED via NNAPI per device; deprecated since Android 15. */
         }
-        part def SyclShimBackend : ComputeBackend {
+        part def SyclShimBackend :> ComputeBackend {
             doc /* SYCL-shaped API on the CPU thread pool. NOT SYCL: genuine = false. */
         }
 
@@ -407,6 +407,37 @@ package AndroidHPC {
             objective {
                 verify portability;
                 verify honest;
+            }
+            return verdict : VerdictKind;
+        }
+        verification def DiscoveryOnDevice {
+            doc /* Open the APK with debug logging on and read the [DISCOVER], [VK], [CL], [GLES]
+                   and [NNAPI] lines: every API family is probed, each device reports its memory
+                   model, workgroup limits and extension count, and an unavailable backend keeps its
+                   reason. Archive the log. */
+            subject sut : AndroidHPCSystem;
+            objective {
+                verify multiApi;
+                verify memory;
+                verify observability;
+            }
+            return verdict : VerdictKind;
+        }
+        verification def BenchmarkReportComplete {
+            doc /* hpc_cli --preset small --json report.json (the CI smoke benchmark): all five
+                   kernels present with min, median, mean, p95 and stddev, and no energy figure. */
+            subject sut : AndroidHPCSystem;
+            objective {
+                verify bench;
+            }
+            return verdict : VerdictKind;
+        }
+        verification def BackendAddedWithoutHarnessChange {
+            doc /* Review: the harness in bench.cpp talks only to Backend and Execution; the
+                   sycl-shim backend was added without editing it. */
+            subject sut : AndroidHPCSystem;
+            objective {
+                verify extensibility;
             }
             return verdict : VerdictKind;
         }

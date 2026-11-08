@@ -42,9 +42,22 @@ hardware; it does not reuse the transcript's code.
 | 8 | `verify` directly in `verification def` | **Confirmed** | GRAMMAR. `verify` belongs in `objective { }` |
 | 9 | `expose` inside `view def` | **Confirmed** | DOC: [only view usages can expose elements](https://huggingface.co/datasets/sysmlv2research/tutorials_summary/commit/6d0b85792e7cb4d91f1d2e2d63821fadb6cbbaec) |
 
-**Not machine-validated.** A SysML v2 parser could not be installed in the authoring environment, so
-`model/AndroidHPC.sysml` was checked by hand, not parsed. Run it through SysIDE or the OMG Pilot
-Implementation before treating it as conformant. This is the one verification gap in the model.
+**Machine-checked (added later, 2026-11-08), with one FLOSS parser.** The first version of the model
+was checked by hand only. Running it through the MIT-licensed language server
+[`sysml-v2-lsp`](https://github.com/daltskin/sysml-v2-lsp) (`scripts/check-sysml.cjs`, also run in CI)
+found two real defects that the hand check had missed, both now fixed:
+
+- `part def X : ComputeBackend` is invalid; a definition specializes with `:>`, and `:` types a usage.
+  Six backend definitions were wrong.
+- `action verify : ...` used `verify`, a reserved keyword, as a name (renamed `verifyResult`).
+
+It also reported five satisfied requirements with no verification case; three new verification
+definitions now cover them. Result: 0 errors, 1 warning (a top-level definition, `AndroidDevice`, that
+no usage refers to). The tool was checked against a deliberately broken file, which it rejected.
+
+Limits: `sysml-v2-lsp` is an independent ANTLR implementation, not the OMG reference, so a clean result
+is strong evidence of valid syntax and resolvable names but not a conformance certificate. The OMG
+Pilot Implementation (EPL-2.0, Java) is the reference to use for that.
 
 ### Defects in the Gemini *replacement* model (turn 5, "Part I: Upgraded OMG SysML v2")
 

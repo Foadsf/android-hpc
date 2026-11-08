@@ -31,6 +31,19 @@ jobs:
           name: host-linux-report
           path: build/small.json
 
+  sysml-model:
+    # Parses and checks model/AndroidHPC.sysml with the FLOSS sysml-v2-lsp (MIT); fails on errors.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install sysml-v2-lsp
+        run: npm install --prefix "$RUNNER_TEMP/lsp" sysml-v2-lsp@0.42.0 --ignore-scripts --no-audit --no-fund
+      - name: Check the model
+        run: node scripts/check-sysml.cjs model/AndroidHPC.sysml --lsp-dir "$RUNNER_TEMP/lsp"
+
   android-apk:
     runs-on: ubuntu-24.04
     steps:
