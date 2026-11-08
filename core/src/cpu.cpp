@@ -2,6 +2,7 @@
 #include "hpc/cpu.hpp"
 
 #include <algorithm>
+#include "hpc/log.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -91,6 +92,9 @@ CpuInfo probeCpu() {
 #elif defined(__x86_64__) || defined(_M_X64)
   ci.isa = "x86-64 (SSE2 baseline)";
 #endif
+  HPC_LOGV("[CPU] probeCpu: arch=%s logicalCores=%u bigCores=%zu heterogeneous=%d metricReadable=%d isa=%s",
+           ci.arch.c_str(), ci.logicalCores, ci.bigCores.size(),
+           ci.heterogeneous ? 1 : 0, ci.metricReadable ? 1 : 0, ci.isa.c_str());
   return ci;
 }
 
@@ -150,6 +154,8 @@ ThreadPool::ThreadPool(unsigned workers, const std::vector<int>& pinTo)
   // Give workers a moment to record pin results (informational only).
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   pinnedOk_ = impl_->pinOk.load();
+  HPC_LOGI("[CPU] ThreadPool created: workers=%u pinTargets=%zu pinnedOk=%u",
+           nWorkers_, pinTo.size(), pinnedOk_);
 }
 
 ThreadPool::~ThreadPool() {

@@ -10,7 +10,10 @@
 #include <GLES2/gl2ext.h>  // must follow gl31.h (needs the GL types)
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+
+#include "hpc/log.hpp"
 
 #include "es_sgemm.inc"
 #include "es_conv3x3.inc"
@@ -20,6 +23,28 @@
 namespace hpc {
 namespace {
 
+std::string eglErrStr(EGLint err) {
+  char b[32];
+  std::snprintf(b, sizeof b, "0x%04X", static_cast<unsigned>(err));
+  return b;
+}
+
+std::string glErrStr(GLenum err) {
+  char b[32];
+  std::snprintf(b, sizeof b, "0x%04X", static_cast<unsigned>(err));
+  return b;
+}
+
+std::string safeGlString(GLenum name) {
+  const GLubyte* p = glGetString(name);
+  if (!p) {
+    HPC_LOGW("[GLES] glGetString(0x%04X) returned nullptr (glGetError=%s)",
+             static_cast<unsigned>(name), glErrStr(glGetError()).c_str());
+    return "unknown";
+  }
+  return sanitizeAscii(reinterpret_cast<const char*>(p));
+}
+
 class EglCtx {
  public:
   EGLDisplay dpy = EGL_NO_DISPLAY;
@@ -28,40 +53,88 @@ class EglCtx {
   std::string error;
 
   bool init() {
+    if (ctx != EGL_NO_CONTEXT && surf != EGL_NO_SURFACE) return true;
     dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    EGLint maj = 0, min = 0;
-    if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &maj, &min)) {
-      error = "eglInitialize failed";
+    if (dpy == EGL_NO_DISPLAY) {
+      EGLint e = eglGetError();
+      error = "eglGetDisplay failed (" + eglErrStr(e) + ")";
+      HPC_LOGW("[GLES] %s", error.c_str());
       return false;
     }
+    EGLint maj = 0, min = 0;
+    if (!eglInitialize(dpy, &maj, &min)) {
+      EGLint e = eglGetError();
+      error = "eglInitialize failed (" + eglErrStr(e) + ")";
+      HPC_LOGW("[GLES] %s", error.c_str());
+      return false;
+    }
+    HPC_LOGI("[GLES] eglInitialize ok: version %d.%d", int(maj), int(min));
     const EGLint cfgAttr[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE};
-    EGLConfig cfg;
+    EGLConfig cfg = nullptr;
     EGLint n = 0;
     if (!eglChooseConfig(dpy, cfgAttr, &cfg, 1, &n) || n < 1) {
-      error = "no EGL config with OpenGL ES 3 + pbuffer";
+      EGLint e = eglGetError();
+      error = "no EGL config with OpenGL ES 3 + pbuffer (" + eglErrStr(e) + ")";
+      HPC_LOGW("[GLES] %s", error.c_str());
       return false;
     }
     const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     surf = eglCreatePbufferSurface(dpy, cfg, pb);
+    if (surf == EGL_NO_SURFACE) {
+      EGLint e = eglGetError();
+      error = "eglCreatePbufferSurface failed (" + eglErrStr(e) + ")";
+      HPC_LOGW("[GLES] %s", error.c_str());
+      return false;
+    }
     const EGLint ca[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ca);
-    if (surf == EGL_NO_SURFACE || ctx == EGL_NO_CONTEXT) {
-      error = "could not create EGL pbuffer/context";
+    if (ctx == EGL_NO_CONTEXT) {
+      EGLint e = eglGetError();
+      error = "eglCreateContext failed (" + eglErrStr(e) + ")";
+      HPC_LOGW("[GLES] %s", error.c_str());
+      eglDestroySurface(dpy, surf);
+      surf = EGL_NO_SURFACE;
+      return false;
+    }
+    HPC_LOGI("[GLES] EGL context (%p) and 1x1 pbuffer surface (%p) created", ctx, surf);
+    return true;
+  }
+  bool makeCurrent() {
+    if (dpy == EGL_NO_DISPLAY || ctx == EGL_NO_CONTEXT || surf == EGL_NO_SURFACE) {
+      if (!init()) return false;
+    }
+    if (eglGetCurrentContext() == ctx) return true;
+    if (eglMakeCurrent(dpy, surf, surf, ctx) != EGL_TRUE) {
+      EGLint e = eglGetError();
+      error = "eglMakeCurrent failed (" + eglErrStr(e) + ")";
+      HPC_LOGW("[GLES] %s", error.c_str());
       return false;
     }
     return true;
   }
-  bool makeCurrent() {
-    if (eglGetCurrentContext() == ctx) return true;
-    return eglMakeCurrent(dpy, surf, surf, ctx) == EGL_TRUE;
+  void release() {
+    if (dpy != EGL_NO_DISPLAY && eglGetCurrentContext() == ctx) {
+      eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
   }
-  void release() { eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT); }
-  ~EglCtx() {
+  void destroyObjects() {
     if (dpy == EGL_NO_DISPLAY) return;
     release();
-    if (ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctx);
-    if (surf != EGL_NO_SURFACE) eglDestroySurface(dpy, surf);
-    eglTerminate(dpy);
+    if (ctx != EGL_NO_CONTEXT) {
+      eglDestroyContext(dpy, ctx);
+      ctx = EGL_NO_CONTEXT;
+    }
+    if (surf != EGL_NO_SURFACE) {
+      eglDestroySurface(dpy, surf);
+      surf = EGL_NO_SURFACE;
+    }
+    // IMPORTANT: Never call eglTerminate(dpy) on EGL_DEFAULT_DISPLAY!
+    // EGL_DEFAULT_DISPLAY is shared across the entire process; terminating it from a
+    // background thread invalidates the display used by Android's UI RenderThread and
+    // crashes the app immediately.
+  }
+  ~EglCtx() {
+    destroyObjects();
   }
 };
 
@@ -83,7 +156,9 @@ GLuint compileProgram(const char* src, std::string* err) {
   if (!ok) {
     char log[1024] = {};
     glGetShaderInfoLog(sh, sizeof log - 1, nullptr, log);
-    if (err) *err = std::string("GLSL compile failed: ") + log;
+    const std::string cleanLog = sanitizeAscii(log);
+    HPC_LOGW("[GLES] shader compile failed: %s", cleanLog.c_str());
+    if (err) *err = std::string("GLSL compile failed: ") + cleanLog;
     glDeleteShader(sh);
     return 0;
   }
@@ -95,10 +170,13 @@ GLuint compileProgram(const char* src, std::string* err) {
   if (!ok) {
     char log[1024] = {};
     glGetProgramInfoLog(pr, sizeof log - 1, nullptr, log);
-    if (err) *err = std::string("GLSL link failed: ") + log;
+    const std::string cleanLog = sanitizeAscii(log);
+    HPC_LOGW("[GLES] program link failed: %s", cleanLog.c_str());
+    if (err) *err = std::string("GLSL link failed: ") + cleanLog;
     glDeleteProgram(pr);
     return 0;
   }
+  HPC_LOGV("[GLES] compiled & linked compute program %u", unsigned(pr));
   return pr;
 }
 
@@ -247,9 +325,15 @@ class GlExecution final : public Execution {
 class GlesBackend final : public Backend {
  public:
   GlesBackend(std::shared_ptr<EglCtx> c, TimerFns t, BackendInfo info) : c_(std::move(c)), tf_(t), info_(std::move(info)) {}
-  ~GlesBackend() override { c_->release(); }
+  ~GlesBackend() override {
+    if (c_) c_->destroyObjects();
+  }
   const BackendInfo& info() const override { return info_; }
   std::unique_ptr<Execution> prepare(const Problem& p, const PrepareOptions&, std::string* err) override {
+    if (!c_->makeCurrent()) {
+      if (err) *err = c_->error.empty() ? "eglMakeCurrent failed" : c_->error;
+      return nullptr;
+    }
     std::unique_ptr<GlExecution> e(new GlExecution(c_, tf_));
     if (!e->build(p, err)) return nullptr;
     return e;
@@ -268,20 +352,28 @@ void discoverGles(std::vector<std::unique_ptr<Backend>>& out) {
   info.id = "gles";
   info.api = "OpenGL ES 3.1 compute";
   auto stub = [&](const std::string& why) {
-    info.note = why;
+    info.note = sanitizeAscii(why);
+    HPC_LOGW("[GLES] unavailable: %s", info.note.c_str());
     out.emplace_back(new StubBackend(info));
   };
   auto c = std::make_shared<EglCtx>();
   if (!c->init()) return stub(c->error);
-  if (!c->makeCurrent()) return stub("eglMakeCurrent failed");
+  if (!c->makeCurrent()) {
+    const std::string why = c->error.empty() ? "eglMakeCurrent failed" : c->error;
+    c->destroyObjects();
+    return stub(why);
+  }
+  while (glGetError() != GL_NO_ERROR) {}  // clear any prior GL error
   GLint maj = 0, min = 0;
   glGetIntegerv(GL_MAJOR_VERSION, &maj);
   glGetIntegerv(GL_MINOR_VERSION, &min);
-  info.device = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
-  info.vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
-  info.driver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+  info.device = safeGlString(GL_RENDERER);
+  info.vendor = safeGlString(GL_VENDOR);
+  info.driver = safeGlString(GL_VERSION);
+  HPC_LOGI("[GLES] context ES %d.%d | renderer='%s' | vendor='%s' | version='%s'",
+           int(maj), int(min), info.device.c_str(), info.vendor.c_str(), info.driver.c_str());
   if (maj < 3 || (maj == 3 && min < 1)) {
-    c->release();
+    c->destroyObjects();
     return stub("context is OpenGL ES " + std::to_string(maj) + "." + std::to_string(min) + ", compute needs 3.1");
   }
   GLint inv = 0, shm = 0;
@@ -289,7 +381,8 @@ void discoverGles(std::vector<std::unique_ptr<Backend>>& out) {
   glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &shm);
   info.detail["max_workgroup_invocations"] = std::to_string(inv);
   info.detail["max_shared_memory_bytes"] = std::to_string(shm);
-  const char* exts = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+  const GLubyte* rawExts = glGetString(GL_EXTENSIONS);
+  const char* exts = reinterpret_cast<const char*>(rawExts);
   TimerFns tf;
   if (exts && std::strstr(exts, "GL_EXT_disjoint_timer_query")) {
     tf.gen = reinterpret_cast<decltype(tf.gen)>(eglGetProcAddress("glGenQueriesEXT"));
@@ -303,7 +396,11 @@ void discoverGles(std::vector<std::unique_ptr<Backend>>& out) {
   info.kernels.assign(std::begin(kAllKernels), std::end(kAllKernels));
   info.available = inv >= 256 && shm >= 4096;
   if (!info.available) info.note = "needs >= 256 invocations per workgroup (limit " + std::to_string(inv) + ")";
-  c->release();
+  // Tear down the probe context/pbuffer now (without eglTerminate); GlesBackend will
+  // lazily create a fresh context/surface in prepare() only if a kernel is actually run.
+  c->destroyObjects();
+  HPC_LOGI("[GLES] discover complete: available=%d maxInv=%d sharedMem=%d timerQuery=%d",
+           info.available ? 1 : 0, int(inv), int(shm), tf.ok() ? 1 : 0);
   out.emplace_back(new GlesBackend(c, tf, info));
 }
 

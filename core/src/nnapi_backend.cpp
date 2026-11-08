@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "hpc/dynlib.hpp"
+#include "hpc/log.hpp"
 
 namespace hpc {
 namespace {
@@ -82,14 +83,20 @@ struct NnApi {
     S(getDevice, "ANeuralNetworks_getDevice") S(deviceGetName, "ANeuralNetworksDevice_getName")
     S(deviceGetType, "ANeuralNetworksDevice_getType") S(deviceGetFeatureLevel, "ANeuralNetworksDevice_getFeatureLevel")
 #undef S
-    if (!modelCreate || !modelFinish || !compCreate || !compFinish || !execCreate || !execSetInput || !execSetOutput) {
+    if (!modelCreate || !modelAddOperand || !modelSetOperandValue || !modelAddOperation ||
+        !modelIdentify || !modelFinish || !compCreate || !compFinish || !execCreate ||
+        !execSetInput || !execSetOutput) {
       error = "libneuralnetworks.so is missing core NNAPI entry points";
+      HPC_LOGW("[NNAPI] %s", error.c_str());
       return false;
     }
     if (!execCompute) {
       error = "NNAPI < 29 (no synchronous compute); not supported by this backend";
+      HPC_LOGW("[NNAPI] %s", error.c_str());
       return false;
     }
+    HPC_LOGI("[NNAPI] loaded libneuralnetworks.so (getDeviceCount=%p, compCreateForDevices=%p)",
+             reinterpret_cast<void*>(getDeviceCount), reinterpret_cast<void*>(compCreateForDevices));
     return true;
   }
 };
@@ -136,9 +143,16 @@ class NnExec final : public Execution {
     } else {
       r = api_->compCreate(model_, &comp_);
     }
-    if (r != NN_NO_ERROR) { if (err) *err = "compilation create: " + std::to_string(r); return false; }
+    HPC_LOGV("[NNAPI] compilation create (device=%p) -> rc=%d", static_cast<void*>(device), r);
+    if (r != NN_NO_ERROR || !comp_) {
+      comp_ = nullptr;
+      if (err) *err = "compilation create: " + std::to_string(r);
+      return false;
+    }
     if (api_->compSetPreference) api_->compSetPreference(comp_, NN_PREFER_SUSTAINED_SPEED);
-    if ((r = api_->compFinish(comp_)) != NN_NO_ERROR) {
+    r = api_->compFinish(comp_);
+    HPC_LOGI("[NNAPI] compilation finish (device=%p) -> rc=%d", static_cast<void*>(device), r);
+    if (r != NN_NO_ERROR) {
       if (err) *err = "compilation finish failed (" + std::to_string(r) + "): device likely cannot run fp32 FULLY_CONNECTED";
       return false;
     }
@@ -195,7 +209,8 @@ void discoverNnapi(std::vector<std::unique_ptr<Backend>>& out) {
     BackendInfo i;
     i.id = "nnapi";
     i.api = "NNAPI (deprecated since Android 15)";
-    i.note = api->error;
+    i.note = sanitizeAscii(api->error, 256);
+    HPC_LOGW("[NNAPI] unavailable: %s", i.note.c_str());
     out.emplace_back(new StubBackend(i));
     return;
   }
@@ -208,28 +223,57 @@ void discoverNnapi(std::vector<std::unique_ptr<Backend>>& out) {
     return i;
   };
   uint32_t count = 0;
-  if (api->getDeviceCount && api->getDevice && api->deviceGetName && api->getDeviceCount(&count) == NN_NO_ERROR && count > 0) {
-    for (uint32_t d = 0; d < count; ++d) {
-      NnDevice* dev = nullptr;
-      if (api->getDevice(d, &dev) != NN_NO_ERROR) continue;
-      const char* name = nullptr;
-      api->deviceGetName(dev, &name);
-      int32_t type = 0;
-      if (api->deviceGetType) api->deviceGetType(dev, &type);
-      static const char* tn[] = {"unknown", "other", "cpu", "gpu", "accelerator"};
-      BackendInfo i = base("nnapi:" + std::to_string(d));
-      i.device = name ? name : "?";
-      i.detail["device_type"] = (type >= 0 && type < 5) ? tn[type] : "?";
-      int64_t fl = 0;
-      if (api->deviceGetFeatureLevel && api->deviceGetFeatureLevel(dev, &fl) == NN_NO_ERROR) i.detail["feature_level"] = std::to_string(fl);
-      if (i.device == "nnapi-reference") i.note = "CPU reference implementation, NOT an NPU";
-      else if (type == 4) i.note = "accelerator (NPU/DSP) as reported by the vendor driver";
-      out.emplace_back(new NnBackend(api, dev, i));
+  if (api->getDeviceCount && api->getDevice && api->deviceGetName) {
+    const int rcCount = api->getDeviceCount(&count);
+    HPC_LOGI("[NNAPI] ANeuralNetworks_getDeviceCount -> rc=%d count=%u", rcCount, unsigned(count));
+    if (rcCount == NN_NO_ERROR && count > 0) {
+      if (count > 64) {
+        HPC_LOGW("[NNAPI] clamping unreasonable device count %u -> 64", unsigned(count));
+        count = 64;
+      }
+      for (uint32_t d = 0; d < count; ++d) {
+        NnDevice* dev = nullptr;
+        const int rcDev = api->getDevice(d, &dev);
+        if (rcDev != NN_NO_ERROR || !dev) {
+          HPC_LOGW("[NNAPI] ANeuralNetworks_getDevice(%u) failed: rc=%d dev=%p",
+                   unsigned(d), rcDev, static_cast<void*>(dev));
+          continue;
+        }
+        const char* rawName = nullptr;
+        const int rcName = api->deviceGetName(dev, &rawName);
+        const std::string safeName = (rcName == NN_NO_ERROR && rawName) ? sanitizeAscii(rawName, 256) : "unknown";
+        int32_t type = 0;
+        int rcType = -1;
+        if (api->deviceGetType) {
+          rcType = api->deviceGetType(dev, &type);
+          if (rcType != NN_NO_ERROR) type = 0;
+        }
+        static const char* tn[] = {"unknown", "other", "cpu", "gpu", "accelerator"};
+        BackendInfo i = base("nnapi:" + std::to_string(d));
+        i.device = safeName.empty() ? "unknown" : safeName;
+        i.detail["device_type"] = (type >= 0 && type < 5) ? tn[type] : "unknown";
+        int64_t fl = 0;
+        int rcFl = -1;
+        if (api->deviceGetFeatureLevel) {
+          rcFl = api->deviceGetFeatureLevel(dev, &fl);
+          if (rcFl == NN_NO_ERROR) i.detail["feature_level"] = std::to_string(fl);
+        }
+        if (i.device == "nnapi-reference") i.note = "CPU reference implementation, NOT an NPU";
+        else if (type == 4) i.note = "accelerator (NPU/DSP) as reported by the vendor driver";
+        HPC_LOGI("[NNAPI] device[%u]: name='%s' (rc=%d) type=%d (%s, rc=%d) featureLevel=%lld (rc=%d)",
+                 unsigned(d), i.device.c_str(), rcName, int(type), i.detail["device_type"].c_str(),
+                 rcType, static_cast<long long>(fl), rcFl);
+        out.emplace_back(new NnBackend(api, dev, i));
+      }
+    } else if (rcCount != NN_NO_ERROR) {
+      count = 0;
     }
   }
   BackendInfo a = base("nnapi:auto");
   a.device = "runtime-selected";
-  a.note = count == 0 ? "device enumeration unavailable (NNAPI < 29); runtime chooses the device" : "runtime may split or fall back across the devices above";
+  a.note = count == 0 ? "device enumeration unavailable (NNAPI < 29); runtime chooses the device"
+                      : "runtime may split or fall back across the devices above";
+  HPC_LOGI("[NNAPI] added fallback backend nnapi:auto (enumerated count=%u)", unsigned(count));
   out.emplace_back(new NnBackend(api, nullptr, a));
 }
 

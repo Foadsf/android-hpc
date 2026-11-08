@@ -69,7 +69,7 @@ endforeach()
 
 # ---- library --------------------------------------------------------------------------------
 set(HPC_SOURCES
-  src/types.cpp src/reference.cpp src/cpu.cpp src/cpu_backend.cpp src/sycl_backend.cpp
+  src/log.cpp src/types.cpp src/reference.cpp src/cpu.cpp src/cpu_backend.cpp src/sycl_backend.cpp
   src/opencl_backend.cpp src/gles_backend.cpp src/nnapi_backend.cpp src/discover.cpp src/bench.cpp)
 if(_vk_possible)
   list(APPEND HPC_SOURCES src/vulkan_backend.cpp)

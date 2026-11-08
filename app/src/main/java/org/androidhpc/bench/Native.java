@@ -12,10 +12,22 @@ final class Native {
         try {
             System.loadLibrary("hpcjni");
             loaded = true;
-        } catch (UnsatisfiedLinkError e) {
-            loadError = String.valueOf(e.getMessage());
+        } catch (Throwable e) {
+            loadError = String.valueOf(e);
         }
     }
+
+    /** Initialize native file + breadcrumb logging and async-signal-safe crash handlers. */
+    static native void initLogging(String logPath, String breadcrumbPath, boolean verbose);
+
+    /** Toggle verbose native logging at runtime. */
+    static native void setVerbose(boolean verbose);
+
+    /** Read the last recorded breadcrumb from native memory. */
+    static native String lastBreadcrumb();
+
+    /** Set comma-separated backend families (vulkan, opencl, gles, nnapi) to skip. */
+    static native void setDisabledBackends(String csv);
 
     /** Probe every backend; returns the human-readable report. */
     static native String discover(boolean bigOnly);

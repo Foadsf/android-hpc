@@ -15,6 +15,7 @@
 
 #include "backend_util.hpp"
 #include "hpc/dynlib.hpp"
+#include "hpc/log.hpp"
 
 #if defined(__ANDROID__)
 #include <android/hardware_buffer.h>
@@ -101,8 +102,11 @@ struct Runtime {
       return false;
     }
     uint32_t loaderVer = VK_API_VERSION_1_0;
-    if (enumVer) enumVer(&loaderVer);
+    if (enumVer && enumVer(&loaderVer) != VK_SUCCESS) loaderVer = VK_API_VERSION_1_0;
     apiVersion = loaderVer >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+    HPC_LOGI("[VK] loader version %u.%u.%u (requesting instance API %u.%u)",
+             VK_VERSION_MAJOR(loaderVer), VK_VERSION_MINOR(loaderVer), VK_VERSION_PATCH(loaderVer),
+             VK_VERSION_MAJOR(apiVersion), VK_VERSION_MINOR(apiVersion));
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "android-hpc";
@@ -110,22 +114,49 @@ struct Runtime {
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     VkResult r = createInstance(&ci, nullptr, &inst);
-    if (r != VK_SUCCESS) {
+    if (r != VK_SUCCESS || !inst) {
       error = "vkCreateInstance failed: " + vkr(r);
+      HPC_LOGW("[VK] %s", error.c_str());
       return false;
     }
+    HPC_LOGI("[VK] vkCreateInstance succeeded (%p)", static_cast<void*>(inst));
 #define X(n) f.n = reinterpret_cast<PFN_##n>(gipa(inst, #n));
     HPC_VK_INSTANCE(X)
 #undef X
-    f.getProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(inst, "vkGetPhysicalDeviceProperties2"));
-    if (!f.vkEnumeratePhysicalDevices || !f.vkCreateDevice || !f.vkGetDeviceProcAddr) {
+    if (apiVersion >= VK_API_VERSION_1_1) {
+      f.getProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(inst, "vkGetPhysicalDeviceProperties2"));
+    }
+    if (!f.vkEnumeratePhysicalDevices || !f.vkGetPhysicalDeviceProperties ||
+        !f.vkGetPhysicalDeviceFeatures || !f.vkGetPhysicalDeviceMemoryProperties ||
+        !f.vkGetPhysicalDeviceQueueFamilyProperties || !f.vkCreateDevice ||
+        !f.vkGetDeviceProcAddr || !f.vkEnumerateDeviceExtensionProperties) {
       error = "incomplete Vulkan instance function table";
+      HPC_LOGW("[VK] %s", error.c_str());
       return false;
     }
     uint32_t n = 0;
-    f.vkEnumeratePhysicalDevices(inst, &n, nullptr);
-    phys.resize(n);
-    if (n) f.vkEnumeratePhysicalDevices(inst, &n, phys.data());
+    r = f.vkEnumeratePhysicalDevices(inst, &n, nullptr);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+      error = "vkEnumeratePhysicalDevices(count) failed: " + vkr(r);
+      HPC_LOGW("[VK] %s", error.c_str());
+      return false;
+    }
+    if (n > 64) {
+      HPC_LOGW("[VK] clamping unreasonable physical device count %u -> 64", n);
+      n = 64;
+    }
+    phys.resize(n, VK_NULL_HANDLE);
+    if (n) {
+      r = f.vkEnumeratePhysicalDevices(inst, &n, phys.data());
+      if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        error = "vkEnumeratePhysicalDevices(list) failed: " + vkr(r);
+        HPC_LOGW("[VK] %s", error.c_str());
+        return false;
+      }
+      phys.resize(n);
+    }
+    phys.erase(std::remove(phys.begin(), phys.end(), VK_NULL_HANDLE), phys.end());
+    HPC_LOGI("[VK] enumerated %zu physical device(s)", phys.size());
     if (phys.empty()) {
       error = "Vulkan present but reports no physical devices";
       return false;
@@ -133,7 +164,10 @@ struct Runtime {
     return true;
   }
   ~Runtime() {
-    if (inst && f.vkDestroyInstance) f.vkDestroyInstance(inst, nullptr);
+    // Deliberately do NOT call vkDestroyInstance(inst, nullptr) during the process
+    // lifetime. On Android, vkDestroyInstance causes libvulkan.so to dlclose() the
+    // vendor ICD shared library while ICD worker threads or TLS destructors may still
+    // be active, causing SIGSEGV after discovery returns.
   }
 };
 
@@ -152,8 +186,15 @@ struct Buf {
 class Gpu {
  public:
   Gpu(std::shared_ptr<Runtime> rt, VkPhysicalDevice pd) : rt(std::move(rt)), pd(pd) {
-    this->rt->f.vkGetPhysicalDeviceProperties(pd, &props);
-    this->rt->f.vkGetPhysicalDeviceMemoryProperties(pd, &mem);
+    if (pd && this->rt && this->rt->f.vkGetPhysicalDeviceProperties) {
+      this->rt->f.vkGetPhysicalDeviceProperties(pd, &props);
+      props.deviceName[sizeof(props.deviceName) - 1] = '\0';
+    }
+    if (pd && this->rt && this->rt->f.vkGetPhysicalDeviceMemoryProperties) {
+      this->rt->f.vkGetPhysicalDeviceMemoryProperties(pd, &mem);
+      if (mem.memoryTypeCount > VK_MAX_MEMORY_TYPES) mem.memoryTypeCount = VK_MAX_MEMORY_TYPES;
+      if (mem.memoryHeapCount > VK_MAX_MEMORY_HEAPS) mem.memoryHeapCount = VK_MAX_MEMORY_HEAPS;
+    }
   }
   ~Gpu() {
     if (dev) {
@@ -189,11 +230,19 @@ class Gpu {
 
   static std::set<std::string> deviceExtensions(const Runtime& rt, VkPhysicalDevice pd) {
     std::set<std::string> s;
+    if (!rt.f.vkEnumerateDeviceExtensionProperties || !pd) return s;
     uint32_t n = 0;
-    rt.f.vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+    VkResult r = rt.f.vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n == 0) return s;
+    if (n > 4096) n = 4096;
     std::vector<VkExtensionProperties> v(n);
-    if (n) rt.f.vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, v.data());
-    for (auto& e : v) s.insert(e.extensionName);
+    r = rt.f.vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, v.data());
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) return s;
+    v.resize(std::min<size_t>(n, v.size()));
+    for (auto& e : v) {
+      e.extensionName[sizeof(e.extensionName) - 1] = '\0';
+      s.insert(sanitizeAscii(e.extensionName));
+    }
     return s;
   }
 
@@ -248,14 +297,22 @@ class Gpu {
     dci.enabledExtensionCount = uint32_t(exts.size());
     dci.ppEnabledExtensionNames = exts.data();
     VkResult r = f.vkCreateDevice(pd, &dci, nullptr, &dev);
-    if (r != VK_SUCCESS) {
+    if (r != VK_SUCCESS || !dev) {
       dev = VK_NULL_HANDLE;
       if (err) *err = "vkCreateDevice failed: " + vkr(r);
+      HPC_LOGW("[VK] vkCreateDevice failed: %s", vkr(r).c_str());
       return false;
     }
+    HPC_LOGI("[VK] vkCreateDevice ok (%p), queueFamily=%u, exts=%zu", static_cast<void*>(dev), qfi, exts.size());
 #define X(n) d.n = reinterpret_cast<PFN_##n>(f.vkGetDeviceProcAddr(dev, #n));
     HPC_VK_DEVICE(X)
 #undef X
+    if (!d.vkGetDeviceQueue || !d.vkCreateCommandPool || !d.vkCreateBuffer ||
+        !d.vkAllocateMemory || !d.vkCreateComputePipelines || !d.vkQueueSubmit) {
+      if (err) *err = "incomplete Vulkan device function table";
+      HPC_LOGW("[VK] incomplete Vulkan device function table");
+      return false;
+    }
 #if defined(__ANDROID__)
     if (ahbEnabled)
       d.getAhbProps = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
@@ -269,6 +326,7 @@ class Gpu {
     r = d.vkCreateCommandPool(dev, &pci, nullptr, &pool);
     if (r != VK_SUCCESS) {
       if (err) *err = "vkCreateCommandPool failed: " + vkr(r);
+      HPC_LOGW("[VK] vkCreateCommandPool failed: %s", vkr(r).c_str());
       return false;
     }
     return true;
@@ -817,16 +875,16 @@ class VulkanBackend final : public Backend {
     const auto& pr = gpu_->props;
     static const char* types[] = {"other", "integrated", "discrete", "virtual", "cpu"};
     info_.id = "vulkan:" + std::to_string(index);
-    info_.api = "Vulkan " + std::to_string(VK_VERSION_MAJOR(pr.apiVersion)) + "." + std::to_string(VK_VERSION_MINOR(pr.apiVersion)) +
-                " compute (SPIR-V)";
-    info_.device = pr.deviceName;
-    info_.vendor = vendorName(pr.vendorID);
-    info_.driver = hexStr(pr.driverVersion);
+    info_.api = sanitizeAscii("Vulkan " + std::to_string(VK_VERSION_MAJOR(pr.apiVersion)) + "." +
+                              std::to_string(VK_VERSION_MINOR(pr.apiVersion)) + " compute (SPIR-V)", 256);
+    info_.device = sanitizeAscii(pr.deviceName, 256);
+    info_.vendor = sanitizeAscii(vendorName(pr.vendorID), 256);
+    info_.driver = sanitizeAscii(hexStr(pr.driverVersion), 256);
     info_.kernels.assign(std::begin(kAllKernels), std::end(kAllKernels));
     info_.available = pr.limits.maxComputeWorkGroupInvocations >= 256;
     if (!info_.available) info_.note = "maxComputeWorkGroupInvocations < 256";
     auto& dt = info_.detail;
-    dt["device_type"] = pr.deviceType < 5 ? types[pr.deviceType] : "?";
+    dt["device_type"] = pr.deviceType < 5 ? types[pr.deviceType] : "other";
     dt["memory_model"] = gpu_->uma() ? "unified (host-visible device memory, no staging)" : "discrete (device-local + staging)";
     dt["max_workgroup_invocations"] = std::to_string(pr.limits.maxComputeWorkGroupInvocations);
     dt["max_shared_memory_bytes"] = std::to_string(pr.limits.maxComputeSharedMemorySize);
@@ -834,26 +892,37 @@ class VulkanBackend final : public Backend {
     VkPhysicalDeviceFeatures ft{};
     rt->f.vkGetPhysicalDeviceFeatures(pd, &ft);
     dt["shaderFloat64"] = ft.shaderFloat64 ? "yes" : "no";
-    if (rt->f.getProps2) {
+    if (rt->apiVersion >= VK_API_VERSION_1_1 && pr.apiVersion >= VK_API_VERSION_1_1 && rt->f.getProps2) {
       VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
       VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sg};
       rt->f.getProps2(pd, &p2);
       dt["subgroup_size"] = std::to_string(sg.subgroupSize);
     }
+    size_t extCount = 0;
 #if defined(__ANDROID__)
     const auto have = Gpu::deviceExtensions(*rt, pd);
+    extCount = have.size();
     dt["ahb_import_extension"] = (have.count(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
                                   have.count(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME))
                                      ? "listed (import path unverified on this device until run with zero-copy)"
                                      : "not listed";
 #endif
+    HPC_LOGI("[VK] device %s: name='%s' vendor='%s' api=%u.%u.%u driver=%s type=%s memTypes=%u maxInv=%u sharedMem=%u exts=%zu available=%d",
+             info_.id.c_str(), info_.device.c_str(), info_.vendor.c_str(),
+             VK_VERSION_MAJOR(pr.apiVersion), VK_VERSION_MINOR(pr.apiVersion), VK_VERSION_PATCH(pr.apiVersion),
+             info_.driver.c_str(), dt["device_type"].c_str(), unsigned(gpu_->mem.memoryTypeCount),
+             unsigned(pr.limits.maxComputeWorkGroupInvocations), unsigned(pr.limits.maxComputeSharedMemorySize),
+             extCount, info_.available ? 1 : 0);
   }
   const BackendInfo& info() const override { return info_; }
   std::unique_ptr<Execution> prepare(const Problem& p, const PrepareOptions& opt, std::string* err) override {
     if (!gpu_->init(err)) return nullptr;
     std::unique_ptr<VkExecution> e(new VkExecution(gpu_));
     if (!e->build(p, opt, err)) return nullptr;
-    if (opt.zeroCopy) info_.detail["zero_copy_last"] = e->zeroCopy() ? "AHardwareBuffer import succeeded" : ("fell back to copy: " + e->zeroCopyNote());
+    if (opt.zeroCopy) {
+      info_.detail["zero_copy_last"] =
+          e->zeroCopy() ? "AHardwareBuffer import succeeded" : sanitizeAscii("fell back to copy: " + e->zeroCopyNote(), 256);
+    }
     return e;
   }
 
@@ -870,11 +939,15 @@ void discoverVulkan(std::vector<std::unique_ptr<Backend>>& out) {
     BackendInfo i;
     i.id = "vulkan";
     i.api = "Vulkan compute (SPIR-V)";
-    i.note = rt->error;
+    i.note = sanitizeAscii(rt->error, 256);
+    HPC_LOGW("[VK] unavailable: %s", i.note.c_str());
     out.emplace_back(new StubBackend(i));
     return;
   }
-  for (size_t k = 0; k < rt->phys.size(); ++k) out.emplace_back(new VulkanBackend(rt, rt->phys[k], int(k)));
+  for (size_t k = 0; k < rt->phys.size(); ++k) {
+    if (!rt->phys[k]) continue;
+    out.emplace_back(new VulkanBackend(rt, rt->phys[k], int(k)));
+  }
 }
 
 }  // namespace hpc

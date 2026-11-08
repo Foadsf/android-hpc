@@ -9,6 +9,7 @@
 
 #include "hpc/backend.hpp"
 #include "hpc/cpu.hpp"
+#include "hpc/log.hpp"
 #include "cpu_pool.hpp"
 
 namespace hpc {
@@ -194,13 +195,13 @@ class CpuBackend final : public Backend {
     const size_t used = cores.size() > reserve_ ? cores.size() - reserve_ : 1;
     info_.id = "cpu";
     info_.api = "CPU (C++17 threads)";
-    info_.device = ci.arch + ", " + std::to_string(used) + " of " +
-                   std::to_string(ci.logicalCores) + " cores used";
-    info_.vendor = ci.arch;
+    info_.device = sanitizeAscii(ci.arch + ", " + std::to_string(used) + " of " +
+                                 std::to_string(ci.logicalCores) + " cores used");
+    info_.vendor = sanitizeAscii(ci.arch);
     info_.driver = "portable C++17, auto-vectorised";
     info_.available = true;
     info_.kernels.assign(std::begin(kAllKernels), std::end(kAllKernels));
-    info_.detail["isa"] = ci.isa;
+    info_.detail["isa"] = sanitizeAscii(ci.isa);
     info_.detail["heterogeneous_cores"] = ci.heterogeneous ? "yes" : (ci.metricReadable ? "no" : "unknown");
     info_.detail["topology_readable"] = ci.metricReadable ? "yes" : "no (sysfs hidden)";
     info_.detail["big_cores"] = std::to_string(ci.bigCores.size());

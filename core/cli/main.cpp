@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include "hpc/bench.hpp"
+#include "hpc/log.hpp"
 
 namespace {
 void usage() {
@@ -21,6 +22,8 @@ void usage() {
       "  --big-cores                   pin CPU workers to the fastest cluster(s) only\n"
       "  --zero-copy                   request AHardwareBuffer sharing (Vulkan on Android; experimental)\n"
       "  --no-hetero                   skip the CPU+GPU split experiment\n"
+      "  --verbose                     enable verbose debug logging\n"
+      "  --log-file FILE               write persistent debug log to FILE\n"
       "  --json FILE                   also write the full report as JSON\n"
       "  --list                        discover and print backends, then exit\n"
       "Exit status: 0 all attempted runs verified, 1 a run failed or mismatched the fp64 reference, 2 usage error.");
@@ -37,6 +40,8 @@ std::vector<std::string> split(const std::string& s) {
 int main(int argc, char** argv) {
   hpc::BenchConfig cfg;
   std::string jsonPath;
+  std::string logPath;
+  bool verbose = false;
   bool list = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -57,12 +62,17 @@ int main(int argc, char** argv) {
     else if (a == "--big-cores") cfg.cpuBigOnly = true;
     else if (a == "--zero-copy") cfg.zeroCopy = true;
     else if (a == "--no-hetero") cfg.hetero = false;
+    else if (a == "--verbose") verbose = true;
+    else if (a == "--log-file") logPath = next();
     else if (a == "--json") jsonPath = next();
     else if (a == "--list") list = true;
     else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
   }
   if (cfg.preset != "small" && cfg.preset != "medium" && cfg.preset != "large") { std::fprintf(stderr, "bad preset\n"); return 2; }
   if (cfg.iterations < 1) cfg.iterations = 1;
+
+  hpc::initLog(logPath, logPath.empty() ? "" : (logPath + ".breadcrumb"), verbose);
+  hpc::installCrashHandlers();
 
   if (list) {
     hpc::DiscoverOptions d;

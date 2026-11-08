@@ -109,7 +109,7 @@ via OpenCL 462 GFLOP/s; NVIDIA triad ~163 GB/s. Phones will look very different.
 | Verifier | **Negative-controlled** | corrupt element, NaN and wrong length are rejected |
 | Odd sizes / bounds | **Verified** | 7, 33, 61, 77, 1001, 100003 and a non-square 65x77x77 slice on every available backend |
 | APK build | **Built, signature, 16 KB alignment, manifest checked** | `apksigner`, `zipalign -P 16`, `aapt2 dump badging` |
-| Android runtime (JNI, UI) | **NOT yet run on a device** | no device or emulator was available to the author |
+| Android runtime (JNI, UI) | **0.1.0 crashed on launch on the first real phone; 0.1.1 adds fixes and logging; NOT yet re-verified** | the cause is unconfirmed: no crash log existed. 0.1.1 fixes the most likely causes found by static review (see Debugging a crash) and writes a log that will show the real one |
 | OpenGL ES backend | **Compiles for arm64/x86_64; NOT yet run** | headless EGL cannot run on the Windows host |
 | NNAPI backend | **Compiles; constants checked against NDK r26 headers; NOT yet run** | |
 | Vulkan `AHardwareBuffer` import | **Compiles; NOT yet run, off by default** | falls back to a copy and records why if the import fails |
@@ -133,6 +133,45 @@ scripts/         Android CLI build script
 Adding a backend: implement `hpc::Backend` and `hpc::Execution` (`core/include/hpc/backend.hpp`),
 add a `discoverX()` call in `core/src/discover.cpp`. Adding a kernel: a `Problem` case, an oracle in
 `reference.cpp`, and a kernel per backend.
+
+## Debugging a crash
+
+The app writes synchronous (`fsync`ed) debug logs and durable vendor-driver breadcrumbs to app-specific external storage so that even immediate native crashes (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGABRT`) or vendor driver hangs leave a diagnostic trail on disk.
+
+### Where logs are stored on the phone
+
+- **Logs directory:** `/sdcard/Android/data/org.androidhpc.bench/files/logs/`
+  (falls back to internal `<getFilesDir()>/logs/` if external storage is unavailable)
+- **Per-session log file:** `hpc-<yyyyMMdd-HHmmss>.log` (the newest 10 logs are kept; the absolute path is shown at the top of the app screen and printed as the first line of the log)
+- **Breadcrumb file:** `breadcrumb.txt` (holds the last step entered before a crash, e.g. `discover:opencl:begin`)
+- **Session marker:** `session.open` (created at startup and deleted on clean `onDestroy` when `isFinishing()`)
+
+### Exact `adb` commands to collect crash evidence
+
+Pull all persistent logs and breadcrumb files from the phone:
+```sh
+adb pull /sdcard/Android/data/org.androidhpc.bench/files/logs/
+```
+
+Dump the Android native crash buffer (tombstone summary):
+```sh
+adb logcat -d -b crash
+```
+
+Stream or dump the application's logcat tag (`android-hpc`):
+```sh
+adb logcat -s android-hpc
+```
+
+### How automatic crash quarantine works
+
+1. **Breadcrumbs around vendor driver calls:** Immediately before and after every risky vendor-driver step, native code writes and `fsync`s a breadcrumb using the exact forms:
+   - `discover:<family>:begin` / `discover:<family>:end`
+   - `prepare:<backendId>:<kernel>:begin` / `prepare:<backendId>:<kernel>:end`
+   - `run:<backendId>:<kernel>:begin` / `run:<backendId>:<kernel>:end`
+2. **Unclean exit detection:** At startup, `DebugLog` checks whether `session.open` is still present from the previous launch.
+3. **Quarantine on `:begin`:** If `session.open` exists, the app reads `breadcrumb.txt` and the last 40 lines of the previous log. If the last breadcrumb ends in `:begin`, the corresponding backend family (`vulkan`, `opencl`, `gles`, or `nnapi`) is persisted in `SharedPreferences` and passed to native code via `Native.setDisabledBackends(csv)` before hardware discovery begins.
+4. **Recovery Banner & Re-enable:** On the next launch after a crash, the app displays a yellow recovery banner showing the previous log path, the last breadcrumb, which backend family was quarantined and why, and the last 40 lines of the previous log. Tapping **Re-enable all** clears the quarantine and re-probes all backends.
 
 ## Known limitations
 

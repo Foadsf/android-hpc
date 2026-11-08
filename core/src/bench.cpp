@@ -8,11 +8,14 @@
 #include <sstream>
 #include <thread>
 
+#include <exception>
+
+#include "hpc/log.hpp"
 #include "hpc/reference.hpp"
 
 namespace hpc {
 
-const char* versionString() { return "0.1.0"; }
+const char* versionString() { return "0.1.1"; }
 
 uint32_t presetSize(const std::string& preset, Kernel k) {
   // Sizes keep peak RAM (problem + fp64 reference + device copies) modest on phones.
@@ -78,21 +81,46 @@ std::string statsJson(const Stats& s) {
 
 }  // namespace
 
+namespace {
+BackendInfo sanitizeBackendInfo(BackendInfo bi) {
+  bi.id = sanitizeAscii(bi.id);
+  bi.api = sanitizeAscii(bi.api);
+  bi.device = sanitizeAscii(bi.device);
+  bi.vendor = sanitizeAscii(bi.vendor);
+  bi.driver = sanitizeAscii(bi.driver);
+  bi.note = sanitizeAscii(bi.note);
+  std::map<std::string, std::string> clean;
+  for (const auto& kv : bi.detail) {
+    clean[sanitizeAscii(kv.first)] = sanitizeAscii(kv.second);
+  }
+  bi.detail = std::move(clean);
+  return bi;
+}
+}  // namespace
+
 Report discoverReport(const DiscoverOptions& opt) {
+  HPC_LOGI("[BENCH] discoverReport starting (bigCoresOnly=%d)", opt.cpuBigCoresOnly ? 1 : 0);
   Report r;
   r.version = versionString();
   r.platform = platformName();
   r.cpu = probeCpu();
   auto bs = discoverBackends(opt);
-  for (auto& b : bs) r.backends.push_back(b->info());
+  for (auto& b : bs) {
+    if (b) r.backends.push_back(sanitizeBackendInfo(b->info()));
+  }
+  bs.clear();
+  HPC_LOGI("[BENCH] discoverReport finished (%zu backends)", r.backends.size());
   return r;
 }
 
 Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::atomic<bool>* cancel) {
+  HPC_LOGI("[BENCH] runBenchmarks starting: preset=%s warmup=%d iters=%d zeroCopy=%d hetero=%d bigOnly=%d",
+           sanitizeAscii(cfg.preset).c_str(), cfg.warmup, cfg.iterations,
+           cfg.zeroCopy ? 1 : 0, cfg.hetero ? 1 : 0, cfg.cpuBigOnly ? 1 : 0);
   Report rep;
   rep.version = versionString();
   rep.platform = platformName();
-  rep.preset = cfg.preset;
+  rep.preset = sanitizeAscii(cfg.preset);
   rep.cpu = probeCpu();
   rep.warmup = cfg.warmup;
   rep.iterations = cfg.iterations;
@@ -103,7 +131,9 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
   dopt.cpuBigCoresOnly = cfg.cpuBigOnly;
   say("Discovering backends...");
   auto backends = discoverBackends(dopt);
-  for (auto& b : backends) rep.backends.push_back(b->info());
+  for (auto& b : backends) {
+    if (b) rep.backends.push_back(sanitizeBackendInfo(b->info()));
+  }
 
   std::vector<Kernel> kernels = cfg.kernels.empty() ? std::vector<Kernel>(std::begin(kAllKernels), std::end(kAllKernels)) : cfg.kernels;
   PrepareOptions popt;
@@ -112,7 +142,7 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
   size_t totalJobs = 0;
   for (Kernel k : kernels)
     for (auto& b : backends)
-      if (b->info().available && matches(b->info(), cfg.backends) && b->supports(k)) ++totalJobs;
+      if (b && b->info().available && matches(b->info(), cfg.backends) && b->supports(k)) ++totalJobs;
   size_t job = 0;
 
   for (Kernel k : kernels) {
@@ -126,38 +156,98 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
     std::vector<Ok> okSgemm;
 
     for (auto& b : backends) {
-      const BackendInfo& bi = b->info();
+      if (!b) continue;
+      const BackendInfo bi = sanitizeBackendInfo(b->info());
       if (!bi.available || !matches(bi, cfg.backends) || !b->supports(k)) continue;
       if (cancelled()) { rep.cancelled = true; break; }
       ++job;
-      say("[" + std::to_string(job) + "/" + std::to_string(totalJobs) + "] " + bi.id + " " + kernelName(k) + " " + p.sizeLabel());
+      const char* kName = kernelName(k);
+      say("[" + std::to_string(job) + "/" + std::to_string(totalJobs) + "] " + bi.id + " " + kName + " " + p.sizeLabel());
 
       KernelResult r;
       r.backendId = bi.id; r.api = bi.api; r.device = bi.device; r.genuine = bi.genuine;
-      r.kernel = kernelName(k); r.size = p.sizeLabel();
+      r.kernel = kName; r.size = p.sizeLabel();
       r.flops = p.flops(); r.bytes = p.bytes();
 
+      const std::string prepBegin = "prepare:" + bi.id + ":" + kName + ":begin";
+      const std::string prepEnd = "prepare:" + bi.id + ":" + kName + ":end";
+      const std::string runBegin = "run:" + bi.id + ":" + kName + ":begin";
+      const std::string runEnd = "run:" + bi.id + ":" + kName + ":end";
+
       std::string err;
+      std::unique_ptr<Execution> ex;
       auto t0 = Clock::now();
-      std::unique_ptr<Execution> ex = b->prepare(p, popt, &err);
+      HPC_LOGI("[BENCH] prepare begin: backend=%s kernel=%s size=%s zeroCopy=%d",
+               bi.id.c_str(), kName, r.size.c_str(), popt.zeroCopy ? 1 : 0);
+      setBreadcrumb(prepBegin);
+      try {
+        ex = b->prepare(p, popt, &err);
+      } catch (const std::exception& e) {
+        err = std::string("exception: ") + e.what();
+        ex.reset();
+      } catch (...) {
+        err = "unknown exception in prepare";
+        ex.reset();
+      }
+      setBreadcrumb(prepEnd);
       r.prepareMs = msSince(t0);
-      if (!ex) { r.error = "prepare: " + err; rep.results.push_back(r); rep.allVerified = false; continue; }
+      if (!ex) {
+        r.error = sanitizeAscii("prepare: " + err);
+        HPC_LOGW("[BENCH] prepare failed: backend=%s kernel=%s (%.2f ms): %s",
+                 bi.id.c_str(), kName, r.prepareMs, r.error.c_str());
+        rep.results.push_back(r);
+        rep.allVerified = false;
+        continue;
+      }
+      HPC_LOGI("[BENCH] prepare ok: backend=%s kernel=%s (%.2f ms, zeroCopy=%d)",
+               bi.id.c_str(), kName, r.prepareMs, ex->zeroCopy() ? 1 : 0);
 
       bool good = true;
-      for (int i = 0; i < cfg.warmup && good; ++i) good = ex->run(nullptr, &err);
       std::vector<double> wall, dev;
-      for (int i = 0; i < cfg.iterations && good; ++i) {
-        double d = -1;
-        auto s = Clock::now();
-        good = ex->run(&d, &err);
-        wall.push_back(msSince(s));
-        if (d >= 0) dev.push_back(d);
-        if (cancelled()) break;
-      }
-      if (!good) { r.error = "run: " + err; rep.results.push_back(r); rep.allVerified = false; continue; }
-
       std::vector<float> out;
-      if (!ex->read(out, &err)) { r.error = "read: " + err; rep.results.push_back(r); rep.allVerified = false; continue; }
+      bool readOk = false;
+      setBreadcrumb(runBegin);
+      try {
+        for (int i = 0; i < cfg.warmup && good; ++i) {
+          good = ex->run(nullptr, &err);
+        }
+        for (int i = 0; i < cfg.iterations && good; ++i) {
+          double d = -1;
+          auto s = Clock::now();
+          good = ex->run(&d, &err);
+          wall.push_back(msSince(s));
+          if (d >= 0) dev.push_back(d);
+          if (cancelled()) break;
+        }
+        if (good) {
+          readOk = ex->read(out, &err);
+        }
+      } catch (const std::exception& e) {
+        err = std::string("exception: ") + e.what();
+        good = false;
+        readOk = false;
+      } catch (...) {
+        err = "unknown exception in run/read";
+        good = false;
+        readOk = false;
+      }
+      setBreadcrumb(runEnd);
+
+      if (!good) {
+        r.error = sanitizeAscii("run: " + err);
+        HPC_LOGW("[BENCH] run failed: backend=%s kernel=%s: %s", bi.id.c_str(), kName, r.error.c_str());
+        rep.results.push_back(r);
+        rep.allVerified = false;
+        continue;
+      }
+      if (!readOk) {
+        r.error = sanitizeAscii("read: " + err);
+        HPC_LOGW("[BENCH] read failed: backend=%s kernel=%s: %s", bi.id.c_str(), kName, r.error.c_str());
+        rep.results.push_back(r);
+        rep.allVerified = false;
+        continue;
+      }
+
       const Verdict v = verify(p, ref, out);
       r.ran = true;
       r.verified = v.ok;
@@ -173,6 +263,11 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
       if (!v.ok) {
         rep.allVerified = false;
         r.error = "VERIFICATION FAILED at element " + std::to_string(v.badIndex);
+        HPC_LOGE("[BENCH] verification failed: backend=%s kernel=%s badIndex=%zu maxAbsErr=%g",
+                 bi.id.c_str(), kName, v.badIndex, v.maxAbsErr);
+      } else {
+        HPC_LOGI("[BENCH] result ok: backend=%s kernel=%s size=%s wallMed=%.3fms devMed=%.3fms GFLOP/s=%.2f GB/s=%.2f maxAbsErr=%g",
+                 bi.id.c_str(), kName, r.size.c_str(), r.wallMs.median, r.devMs.median, r.gflops, r.gbps, r.maxAbsErr);
       }
       if (k == Kernel::Sgemm && v.ok && bi.genuine) okSgemm.push_back({bi.id, r.wallMs.median});
       rep.results.push_back(r);
@@ -194,52 +289,73 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
       } else {
         say("Heterogeneous split: cpu + " + gpuId);
         Backend* gpuB = nullptr;
-        for (auto& b : backends) if (b->info().id == gpuId) gpuB = b.get();
-        // A dedicated CPU backend that leaves one core free for the thread driving the GPU;
-        // otherwise pinned CPU workers and the driver thread fight over the same core.
-        DiscoverOptions hopt = dopt;
-        hopt.cpuReserveCores = 1;
-        std::unique_ptr<Backend> cpuOwned = makeCpuBackend(hopt);
-        Backend* cpuB = cpuOwned.get();
-        const double f = gpuMed / (cpuMed + gpuMed);  // CPU share proportional to its throughput
-        uint32_t mc = uint32_t(std::lround(p.m * f / 4.0)) * 4;
-        mc = std::min(std::max(mc, 4u), p.m - 4);
-        Problem pc = sliceRows(p, 0, mc), pg = sliceRows(p, mc, p.m);
-        std::string e1, e2;
-        auto cx = cpuB->prepare(pc, popt, &e1);
-        auto gx = gpuB->prepare(pg, popt, &e2);
-        h.gpuId = gpuId; h.cpuRows = mc; h.gpuRows = p.m - mc;
-        h.cpuAloneMs = cpuMed; h.gpuAloneMs = gpuMed;
-        if (!cx || !gx) {
-          h.error = "prepare failed: " + e1 + " " + e2;
-        } else {
-          bool good = true; bool c1 = true, g1 = true;
-          auto once = [&] {
-            std::thread t([&] { c1 = cx->run(nullptr, &e1); });
-            g1 = gx->run(nullptr, &e2);
-            t.join();
-            return c1 && g1;
-          };
-          for (int i = 0; i < cfg.warmup && good; ++i) good = once();
-          std::vector<double> wall;
-          for (int i = 0; i < cfg.iterations && good; ++i) { auto s = Clock::now(); good = once(); wall.push_back(msSince(s)); }
-          std::vector<float> oc, og;
-          if (good && cx->read(oc, &e1) && gx->read(og, &e2)) {
-            oc.insert(oc.end(), og.begin(), og.end());
-            const Verdict v = verify(p, ref, oc);
-            h.ran = true; h.verified = v.ok; h.maxAbsErr = v.maxAbsErr;
-            h.wallMs = computeStats(wall);
-            h.speedupVsBest = std::min(cpuMed, gpuMed) / h.wallMs.median;
-            if (!v.ok) rep.allVerified = false;
+        for (auto& b : backends) if (b && b->info().id == gpuId) gpuB = b.get();
+        try {
+          // A dedicated CPU backend that leaves one core free for the thread driving the GPU;
+          // otherwise pinned CPU workers and the driver thread fight over the same core.
+          DiscoverOptions hopt = dopt;
+          hopt.cpuReserveCores = 1;
+          std::unique_ptr<Backend> cpuOwned = makeCpuBackend(hopt);
+          Backend* cpuB = cpuOwned.get();
+          const double f = gpuMed / (cpuMed + gpuMed);  // CPU share proportional to its throughput
+          uint32_t mc = uint32_t(std::lround(p.m * f / 4.0)) * 4;
+          mc = std::min(std::max(mc, 4u), p.m - 4);
+          Problem pc = sliceRows(p, 0, mc), pg = sliceRows(p, mc, p.m);
+          std::string e1, e2;
+          setBreadcrumb("prepare:cpu:sgemm:begin");
+          auto cx = cpuB->prepare(pc, popt, &e1);
+          setBreadcrumb("prepare:cpu:sgemm:end");
+          setBreadcrumb("prepare:" + gpuId + ":sgemm:begin");
+          auto gx = gpuB ? gpuB->prepare(pg, popt, &e2) : nullptr;
+          setBreadcrumb("prepare:" + gpuId + ":sgemm:end");
+          h.gpuId = sanitizeAscii(gpuId); h.cpuRows = mc; h.gpuRows = p.m - mc;
+          h.cpuAloneMs = cpuMed; h.gpuAloneMs = gpuMed;
+          if (!cx || !gx) {
+            h.error = sanitizeAscii("prepare failed: " + e1 + " " + e2);
+            HPC_LOGW("[BENCH] hetero prepare failed: %s", h.error.c_str());
           } else {
-            h.error = "run/read failed: " + e1 + " " + e2;
+            bool good = true; bool c1 = true, g1 = true;
+            auto once = [&] {
+              std::thread t([&] { c1 = cx->run(nullptr, &e1); });
+              g1 = gx->run(nullptr, &e2);
+              t.join();
+              return c1 && g1;
+            };
+            setBreadcrumb("run:" + gpuId + ":sgemm:begin");
+            for (int i = 0; i < cfg.warmup && good; ++i) good = once();
+            std::vector<double> wall;
+            for (int i = 0; i < cfg.iterations && good; ++i) { auto s = Clock::now(); good = once(); wall.push_back(msSince(s)); }
+            std::vector<float> oc, og;
+            const bool readBoth = good && cx->read(oc, &e1) && gx->read(og, &e2);
+            setBreadcrumb("run:" + gpuId + ":sgemm:end");
+            if (readBoth) {
+              oc.insert(oc.end(), og.begin(), og.end());
+              const Verdict v = verify(p, ref, oc);
+              h.ran = true; h.verified = v.ok; h.maxAbsErr = v.maxAbsErr;
+              h.wallMs = computeStats(wall);
+              h.speedupVsBest = std::min(cpuMed, gpuMed) / h.wallMs.median;
+              if (!v.ok) rep.allVerified = false;
+              HPC_LOGI("[BENCH] hetero sgemm done: cpuRows=%u gpuRows=%u wallMed=%.3fms speedup=%.2fx verified=%d",
+                       h.cpuRows, h.gpuRows, h.wallMs.median, h.speedupVsBest, h.verified ? 1 : 0);
+            } else {
+              h.error = sanitizeAscii("run/read failed: " + e1 + " " + e2);
+              HPC_LOGW("[BENCH] hetero run/read failed: %s", h.error.c_str());
+            }
           }
+        } catch (const std::exception& e) {
+          h.error = sanitizeAscii(std::string("hetero exception: ") + e.what());
+          HPC_LOGE("[BENCH] %s", h.error.c_str());
+        } catch (...) {
+          h.error = "hetero unknown exception";
+          HPC_LOGE("[BENCH] %s", h.error.c_str());
         }
       }
     }
   }
   // Destroy backends on this thread (GL contexts are thread-bound).
   backends.clear();
+  HPC_LOGI("[BENCH] runBenchmarks finished (allVerified=%d, cancelled=%d)",
+           rep.allVerified ? 1 : 0, rep.cancelled ? 1 : 0);
   return rep;
 }
 

@@ -8,6 +8,7 @@
 
 #include "backend_util.hpp"
 #include "hpc/dynlib.hpp"
+#include "hpc/log.hpp"
 
 namespace hpc {
 namespace {
@@ -77,24 +78,28 @@ struct ClApi {
 #else
             "libOpenCL.so", "libOpenCL.so.1", "/vendor/lib64/libOpenCL.so", "/system/vendor/lib64/libOpenCL.so",
             "/vendor/lib/libOpenCL.so", "libOpenCL-pixel.so", "/system/lib64/libOpenCL.so",
-            "libOpenCL-car.so", "libGLES_mali.so"  // last resort: some Mali drivers export OpenCL from here
+            "libOpenCL-car.so"
 #endif
         },
                   &tried)) {
-      error = "no OpenCL runtime found (tried: " + tried + ")";
+      error = sanitizeAscii("no OpenCL runtime found (tried: " + tried + ")", 256);
+      HPC_LOGW("[CL] %s", error.c_str());
       return false;
     }
-#define L(n)                                                          \
-  n = lib.sym<decltype(n)>("cl" #n);                                  \
-  if (!n) {                                                           \
-    error = std::string("missing symbol cl" #n " in ") + lib.path();  \
-    return false;                                                     \
+#define L(n)                                                                             \
+  n = lib.sym<decltype(n)>("cl" #n);                                                     \
+  if (!n) {                                                                              \
+    error = sanitizeAscii(std::string("missing symbol cl" #n " in ") + lib.path(), 256); \
+    HPC_LOGW("[CL] %s", error.c_str());                                                  \
+    lib.close();                                                                         \
+    return false;                                                                        \
   }
     L(GetPlatformIDs) L(GetPlatformInfo) L(GetDeviceIDs) L(GetDeviceInfo) L(CreateContext) L(ReleaseContext)
     L(CreateCommandQueue) L(ReleaseCommandQueue) L(CreateBuffer) L(ReleaseMemObject) L(CreateProgramWithSource)
     L(BuildProgram) L(GetProgramBuildInfo) L(ReleaseProgram) L(CreateKernel) L(ReleaseKernel) L(SetKernelArg)
     L(EnqueueNDRangeKernel) L(EnqueueReadBuffer) L(Finish) L(WaitForEvents) L(GetEventProfilingInfo) L(ReleaseEvent)
 #undef L
+    HPC_LOGI("[CL] loaded OpenCL runtime from %s", lib.path().c_str());
     return true;
   }
 };
@@ -152,13 +157,26 @@ __kernel void triad(__global const float* A, __global const float* B, __global f
 }
 )CLC";
 
-std::string infoStr(ClApi& cl, cl_device_id d, cl_uint what) {
+std::string platInfoStr(ClApi& cl, cl_platform_id p, cl_uint what, size_t maxOut = 256) {
+  if (!p || !cl.GetPlatformInfo) return "";
+  size_t n = 0;
+  if (cl.GetPlatformInfo(p, what, 0, nullptr, &n) != CL_SUCCESS || n == 0) return "";
+  n = std::min<size_t>(n, 4096);
+  std::vector<char> buf(n, '\0');
+  if (cl.GetPlatformInfo(p, what, n, buf.data(), nullptr) != CL_SUCCESS) return "";
+  buf.back() = '\0';
+  return sanitizeAscii(buf.data(), maxOut);
+}
+
+std::string infoStr(ClApi& cl, cl_device_id d, cl_uint what, size_t maxOut = 256) {
+  if (!d || !cl.GetDeviceInfo) return "";
   size_t n = 0;
   if (cl.GetDeviceInfo(d, what, 0, nullptr, &n) != CL_SUCCESS || n == 0) return "";
-  std::string s(n, '\0');
-  cl.GetDeviceInfo(d, what, n, &s[0], nullptr);
-  while (!s.empty() && s.back() == '\0') s.pop_back();
-  return s;
+  n = std::min<size_t>(n, 4096);
+  std::vector<char> buf(n, '\0');
+  if (cl.GetDeviceInfo(d, what, n, buf.data(), nullptr) != CL_SUCCESS) return "";
+  buf.back() = '\0';
+  return sanitizeAscii(buf.data(), maxOut);
 }
 
 struct ClDevice {
@@ -172,20 +190,29 @@ struct ClDevice {
     if (ctx) api->ReleaseContext(ctx);
   }
   bool init(std::string* err) {
-    if (ctx) return true;
+    if (ctx && q) return true;
+    if (!dev) {
+      if (err) *err = "null cl_device_id";
+      return false;
+    }
     cl_int e = 0;
     ctx = api->CreateContext(nullptr, 1, &dev, nullptr, nullptr, &e);
     if (!ctx || e != CL_SUCCESS) {
       ctx = nullptr;
       if (err) *err = "clCreateContext failed: " + std::to_string(e);
+      HPC_LOGW("[CL] clCreateContext failed: %d", int(e));
       return false;
     }
     q = api->CreateCommandQueue(ctx, dev, CL_QUEUE_PROFILING_ENABLE, &e);
     if (!q || e != CL_SUCCESS) {
       q = nullptr;
+      api->ReleaseContext(ctx);
+      ctx = nullptr;
       if (err) *err = "clCreateCommandQueue failed: " + std::to_string(e);
+      HPC_LOGW("[CL] clCreateCommandQueue failed: %d", int(e));
       return false;
     }
+    HPC_LOGI("[CL] context (%p) and command queue (%p) created", static_cast<void*>(ctx), static_cast<void*>(q));
     return true;
   }
 };
@@ -255,9 +282,13 @@ class ClExecution final : public Execution {
     if (e != CL_SUCCESS) {
       size_t n = 0;
       cl_.GetProgramBuildInfo(prog_, d_->dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &n);
-      std::string log(n, '\0');
-      if (n) cl_.GetProgramBuildInfo(prog_, d_->dev, CL_PROGRAM_BUILD_LOG, n, &log[0], nullptr);
-      if (err) *err = "OpenCL build failed (" + std::to_string(e) + "): " + log.substr(0, 400);
+      n = std::min<size_t>(n, 4096);
+      std::vector<char> log(n ? n : 1, '\0');
+      if (n) cl_.GetProgramBuildInfo(prog_, d_->dev, CL_PROGRAM_BUILD_LOG, n, log.data(), nullptr);
+      log.back() = '\0';
+      const std::string cleanLog = sanitizeAscii(log.data(), 256);
+      HPC_LOGW("[CL] clBuildProgram failed (%d): %s", int(e), cleanLog.c_str());
+      if (err) *err = "OpenCL build failed (" + std::to_string(e) + "): " + cleanLog;
       return false;
     }
     auto mk = [&](const char* name) {
@@ -368,30 +399,28 @@ class OpenCLBackend final : public Backend {
     d_->api = api;
     d_->dev = dev;
     ClApi& cl = *api;
-    size_t n = 0;
-    cl.GetPlatformInfo(plat, CL_PLATFORM_NAME, 0, nullptr, &n);
-    std::string pname(n, '\0');
-    if (n) cl.GetPlatformInfo(plat, CL_PLATFORM_NAME, n, &pname[0], nullptr);
-    while (!pname.empty() && pname.back() == '\0') pname.pop_back();
+    const std::string pname = platInfoStr(cl, plat, CL_PLATFORM_NAME, 256);
     cl_bitfield type = 0;
-    cl.GetDeviceInfo(dev, CL_DEVICE_TYPE, sizeof type, &type, nullptr);
+    if (cl.GetDeviceInfo(dev, CL_DEVICE_TYPE, sizeof type, &type, nullptr) != CL_SUCCESS) type = 0;
     cl_uint cu = 0;
-    cl.GetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof cu, &cu, nullptr);
+    if (cl.GetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof cu, &cu, nullptr) != CL_SUCCESS) cu = 0;
     size_t wg = 0;
-    cl.GetDeviceInfo(dev, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr);
+    if (cl.GetDeviceInfo(dev, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr) != CL_SUCCESS) wg = 0;
     cl_ulong lmem = 0;
-    cl.GetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof lmem, &lmem, nullptr);
+    if (cl.GetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof lmem, &lmem, nullptr) != CL_SUCCESS) lmem = 0;
     cl_bool unified = 0;
-    cl.GetDeviceInfo(dev, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof unified, &unified, nullptr);
+    if (cl.GetDeviceInfo(dev, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof unified, &unified, nullptr) != CL_SUCCESS) unified = 0;
     d_->maxWg = wg;
 
+    const std::string devVer = infoStr(cl, dev, CL_DEVICE_VERSION, 256);
+    const std::string exts = infoStr(cl, dev, CL_DEVICE_EXTENSIONS, 4096);
     info_.id = "opencl:" + std::to_string(index);
-    info_.api = "OpenCL (" + infoStr(cl, dev, CL_DEVICE_VERSION) + ")";
-    info_.device = infoStr(cl, dev, CL_DEVICE_NAME);
-    info_.vendor = infoStr(cl, dev, CL_DEVICE_VENDOR);
-    info_.driver = infoStr(cl, dev, CL_DRIVER_VERSION);
+    info_.api = sanitizeAscii("OpenCL (" + devVer + ")", 256);
+    info_.device = infoStr(cl, dev, CL_DEVICE_NAME, 256);
+    info_.vendor = infoStr(cl, dev, CL_DEVICE_VENDOR, 256);
+    info_.driver = infoStr(cl, dev, CL_DRIVER_VERSION, 256);
     info_.kernels.assign(std::begin(kAllKernels), std::end(kAllKernels));
-    info_.available = wg >= 256 && lmem >= 4096;
+    info_.available = dev != nullptr && wg >= 256 && lmem >= 4096;
     if (!info_.available) info_.note = "needs work-group size >= 256 and >= 4 KiB local memory";
     auto& dt = info_.detail;
     dt["platform"] = pname;
@@ -400,8 +429,12 @@ class OpenCLBackend final : public Backend {
     dt["max_work_group_size"] = std::to_string(wg);
     dt["local_mem_bytes"] = std::to_string(lmem);
     dt["host_unified_memory"] = unified ? "yes" : "no";
-    dt["fp64"] = infoStr(cl, dev, CL_DEVICE_EXTENSIONS).find("cl_khr_fp64") != std::string::npos ? "yes" : "no";
-    dt["runtime_library"] = api->lib.path();
+    dt["fp64"] = exts.find("cl_khr_fp64") != std::string::npos ? "yes" : "no";
+    dt["runtime_library"] = sanitizeAscii(api->lib.path(), 256);
+    HPC_LOGI("[CL] device %s: name='%s' vendor='%s' driver='%s' type=%s cu=%u maxWg=%zu localMem=%llu available=%d",
+             info_.id.c_str(), info_.device.c_str(), info_.vendor.c_str(), info_.driver.c_str(),
+             dt["device_type"].c_str(), unsigned(cu), wg, static_cast<unsigned long long>(lmem),
+             info_.available ? 1 : 0);
   }
   const BackendInfo& info() const override { return info_; }
   std::unique_ptr<Execution> prepare(const Problem& p, const PrepareOptions&, std::string* err) override {
@@ -424,22 +457,51 @@ void discoverOpenCL(std::vector<std::unique_ptr<Backend>>& out) {
     BackendInfo i;
     i.id = "opencl";
     i.api = "OpenCL";
-    i.note = why;
+    i.note = sanitizeAscii(why, 256);
+    HPC_LOGW("[CL] unavailable: %s", i.note.c_str());
     out.emplace_back(new StubBackend(i));
   };
   if (!api->load()) return stub(api->error);
   cl_uint np = 0;
   cl_int r = api->GetPlatformIDs(0, nullptr, &np);
-  if (r != CL_SUCCESS || np == 0) return stub("OpenCL runtime loaded (" + api->lib.path() + ") but reports no platforms (code " + std::to_string(r) + ")");
-  std::vector<cl_platform_id> plats(np);
-  api->GetPlatformIDs(np, plats.data(), nullptr);
+  HPC_LOGI("[CL] clGetPlatformIDs(count) -> rc=%d count=%u", int(r), unsigned(np));
+  if (r != CL_SUCCESS || np == 0) {
+    return stub("OpenCL runtime loaded (" + sanitizeAscii(api->lib.path(), 160) +
+                ") but reports no platforms (code " + std::to_string(r) + ")");
+  }
+  if (np > 64) {
+    HPC_LOGW("[CL] clamping unreasonable platform count %u -> 64", unsigned(np));
+    np = 64;
+  }
+  std::vector<cl_platform_id> plats(np, nullptr);
+  r = api->GetPlatformIDs(np, plats.data(), nullptr);
+  if (r != CL_SUCCESS) {
+    return stub("clGetPlatformIDs(list) failed (code " + std::to_string(r) + ")");
+  }
   int idx = 0;
-  for (auto pl : plats) {
+  for (cl_uint pi = 0; pi < np; ++pi) {
+    cl_platform_id pl = plats[pi];
+    if (!pl) continue;
+    const std::string pname = platInfoStr(*api, pl, CL_PLATFORM_NAME, 256);
     cl_uint nd = 0;
-    if (api->GetDeviceIDs(pl, CL_DEVICE_TYPE_ALL, 0, nullptr, &nd) != CL_SUCCESS || nd == 0) continue;
-    std::vector<cl_device_id> devs(nd);
-    api->GetDeviceIDs(pl, CL_DEVICE_TYPE_ALL, nd, devs.data(), nullptr);
-    for (auto d : devs) out.emplace_back(new OpenCLBackend(api, pl, d, idx++));
+    cl_int dr = api->GetDeviceIDs(pl, CL_DEVICE_TYPE_ALL, 0, nullptr, &nd);
+    HPC_LOGI("[CL] platform[%u] '%s': clGetDeviceIDs(count) -> rc=%d count=%u",
+             unsigned(pi), pname.c_str(), int(dr), unsigned(nd));
+    if (dr != CL_SUCCESS || nd == 0) continue;
+    if (nd > 64) {
+      HPC_LOGW("[CL] clamping unreasonable device count %u -> 64", unsigned(nd));
+      nd = 64;
+    }
+    std::vector<cl_device_id> devs(nd, nullptr);
+    dr = api->GetDeviceIDs(pl, CL_DEVICE_TYPE_ALL, nd, devs.data(), nullptr);
+    if (dr != CL_SUCCESS) {
+      HPC_LOGW("[CL] platform[%u] clGetDeviceIDs(list) failed: %d", unsigned(pi), int(dr));
+      continue;
+    }
+    for (auto d : devs) {
+      if (!d) continue;
+      out.emplace_back(new OpenCLBackend(api, pl, d, idx++));
+    }
   }
   if (idx == 0) stub("OpenCL platforms present but no devices");
 }
