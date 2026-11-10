@@ -35,8 +35,14 @@ the API provides it, on-device time.
 
 ## Get the APK
 
-A debug-signed APK is built by CI on every push (Actions artifact `android-hpc-debug-apk`) and the
-build below produces it locally at `app/build/outputs/apk/debug/app-debug.apk`.
+Every merge to `main` that passes CI is published as a GitHub Release. The newest APK is always at
+**[releases/latest/download/android-hpc.apk](https://github.com/foadsf/android-hpc/releases/latest/download/android-hpc.apk)**
+(a `.sha256` file sits next to it). Each build gets a higher `versionCode` (100 + CI run number) and
+all builds are signed with the same, deliberately public debug key (`app/ci-debug.keystore`), so a new
+APK installs as an update over the previous one. Builds from before 0.2.0 were signed with throwaway
+keys: uninstall such a build once before installing a release. Pull requests still get the APK as the
+Actions artifact `android-hpc-debug-apk`. The build below produces it locally at
+`app/build/outputs/apk/debug/app-debug.apk` (versionCode 5, so `adb install -r -d` to go back from a CI build).
 
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
