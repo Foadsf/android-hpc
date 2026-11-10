@@ -28,6 +28,13 @@ void usage() {
       "  --list                        discover and print backends, then exit\n"
       "Exit status: 0 all attempted runs verified, 1 a run failed or mismatched the fp64 reference, 2 usage error.");
 }
+// Strict non-negative integer parse: rejects "", "abc", "12x", "-3" and values above `maxV`.
+bool parseUInt(const std::string& s, unsigned long maxV, unsigned long& out) {
+  if (s.empty() || s.size() > 12) return false;
+  for (char c : s) if (c < '0' || c > '9') return false;
+  out = std::strtoul(s.c_str(), nullptr, 10);
+  return out <= maxV;
+}
 std::vector<std::string> split(const std::string& s) {
   std::vector<std::string> v;
   std::stringstream ss(s);
@@ -56,9 +63,15 @@ int main(int argc, char** argv) {
       const auto eq = v.find('=');
       hpc::Kernel k;
       if (eq == std::string::npos || !hpc::parseKernel(v.substr(0, eq), k)) { std::fprintf(stderr, "bad --size %s (want kernel=N)\n", v.c_str()); return 2; }
-      cfg.sizeOverride[int(k)] = uint32_t(std::strtoul(v.c_str() + eq + 1, nullptr, 10));
-    } else if (a == "--warmup") cfg.warmup = std::atoi(next().c_str());
-    else if (a == "--iters") cfg.iterations = std::atoi(next().c_str());
+      unsigned long n = 0;
+      if (!parseUInt(v.substr(eq + 1), 1ul << 30, n) || n == 0) { std::fprintf(stderr, "bad --size %s (N must be 1..2^30)\n", v.c_str()); return 2; }
+      cfg.sizeOverride[int(k)] = uint32_t(n);
+    } else if (a == "--warmup" || a == "--iters") {
+      const std::string v = next();
+      unsigned long n = 0;
+      if (!parseUInt(v, 100000, n) || (a == "--iters" && n == 0)) { std::fprintf(stderr, "bad %s %s\n", a.c_str(), v.c_str()); return 2; }
+      (a == "--warmup" ? cfg.warmup : cfg.iterations) = int(n);
+    }
     else if (a == "--big-cores") cfg.cpuBigOnly = true;
     else if (a == "--zero-copy") cfg.zeroCopy = true;
     else if (a == "--no-hetero") cfg.hetero = false;
@@ -69,7 +82,6 @@ int main(int argc, char** argv) {
     else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
   }
   if (cfg.preset != "small" && cfg.preset != "medium" && cfg.preset != "large") { std::fprintf(stderr, "bad preset\n"); return 2; }
-  if (cfg.iterations < 1) cfg.iterations = 1;
 
   hpc::initLog(logPath, logPath.empty() ? "" : (logPath + ".breadcrumb"), verbose);
   hpc::installCrashHandlers();
@@ -83,8 +95,10 @@ int main(int argc, char** argv) {
   const hpc::Report rep = hpc::runBenchmarks(cfg, [](const std::string& s) { std::fprintf(stderr, "%s\n", s.c_str()); }, nullptr);
   std::cout << hpc::toText(rep);
   if (!jsonPath.empty()) {
-    std::ofstream f(jsonPath);
+    std::ofstream f(jsonPath, std::ios::binary);
     f << hpc::toJson(rep);
+    f.close();
+    if (!f) { std::fprintf(stderr, "error: could not write %s\n", jsonPath.c_str()); return 1; }
     std::fprintf(stderr, "wrote %s\n", jsonPath.c_str());
   }
   bool anyRan = false;

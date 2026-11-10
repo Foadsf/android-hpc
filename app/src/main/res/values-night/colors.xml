@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <color name="bg">#0E1117</color>
+    <color name="surface">#171B23</color>
+    <color name="surface_variant">#1F2430</color>
+    <color name="outline">#2B3240</color>
+    <color name="on_surface">#E7EAF0</color>
+    <color name="on_surface_variant">#A0A9BA</color>
+    <color name="primary">#9CB1FF</color>
+    <color name="on_primary">#0B1A5C</color>
+    <color name="primary_container">#24326B</color>
+    <color name="on_primary_container">#DCE3FF</color>
+    <color name="success">#7BD99A</color>
+    <color name="success_container">#17331F</color>
+    <color name="error">#FF9C93</color>
+    <color name="error_container">#44191A</color>
+    <color name="warning">#FFD27A</color>
+    <color name="warning_container">#3A2F12</color>
+    <color name="track">#262C38</color>
+</resources>

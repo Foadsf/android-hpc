@@ -4,6 +4,7 @@
 // (values from the Khronos OpenCL 1.2 headers). On Android 12+ the manifest must also declare
 // <uses-native-library android:name="libOpenCL.so" android:required="false"/>.
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "backend_util.hpp"
@@ -38,6 +39,7 @@ constexpr cl_uint CL_DEVICE_TYPE = 0x1000, CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002,
                   CL_DEVICE_VERSION = 0x102F, CL_DEVICE_EXTENSIONS = 0x1030, CL_DEVICE_HOST_UNIFIED_MEMORY = 0x1035,
                   CL_DEVICE_LOCAL_MEM_SIZE = 0x1023;
 constexpr cl_uint CL_PROFILING_COMMAND_START = 0x1282, CL_PROFILING_COMMAND_END = 0x1283, CL_PROGRAM_BUILD_LOG = 0x1183;
+constexpr cl_uint CL_KERNEL_WORK_GROUP_SIZE = 0x11B0;
 constexpr cl_bitfield CL_DEVICE_TYPE_CPU = 1 << 1, CL_DEVICE_TYPE_GPU = 1 << 2, CL_DEVICE_TYPE_ACCELERATOR = 1 << 3,
                       CL_DEVICE_TYPE_ALL = 0xFFFFFFFFull;
 
@@ -60,6 +62,7 @@ struct ClApi {
   cl_kernel (*CreateKernel)(cl_program, const char*, cl_int*) = nullptr;
   cl_int (*ReleaseKernel)(cl_kernel) = nullptr;
   cl_int (*SetKernelArg)(cl_kernel, cl_uint, size_t, const void*) = nullptr;
+  cl_int (*GetKernelWorkGroupInfo)(cl_kernel, cl_device_id, cl_uint, size_t, void*, size_t*) = nullptr;
   cl_int (*EnqueueNDRangeKernel)(cl_command_queue, cl_kernel, cl_uint, const size_t*, const size_t*, const size_t*,
                                  cl_uint, const cl_event*, cl_event*) = nullptr;
   cl_int (*EnqueueReadBuffer)(cl_command_queue, cl_mem, cl_bool, size_t, size_t, void*, cl_uint, const cl_event*,
@@ -96,7 +99,7 @@ struct ClApi {
   }
     L(GetPlatformIDs) L(GetPlatformInfo) L(GetDeviceIDs) L(GetDeviceInfo) L(CreateContext) L(ReleaseContext)
     L(CreateCommandQueue) L(ReleaseCommandQueue) L(CreateBuffer) L(ReleaseMemObject) L(CreateProgramWithSource)
-    L(BuildProgram) L(GetProgramBuildInfo) L(ReleaseProgram) L(CreateKernel) L(ReleaseKernel) L(SetKernelArg)
+    L(BuildProgram) L(GetProgramBuildInfo) L(ReleaseProgram) L(CreateKernel) L(ReleaseKernel) L(SetKernelArg) L(GetKernelWorkGroupInfo)
     L(EnqueueNDRangeKernel) L(EnqueueReadBuffer) L(Finish) L(WaitForEvents) L(GetEventProfilingInfo) L(ReleaseEvent)
 #undef L
     HPC_LOGI("[CL] loaded OpenCL runtime from %s", lib.path().c_str());
@@ -104,8 +107,16 @@ struct ClApi {
   }
 };
 
+// T: 2D tile edge (T*T work-items), WG1: 1D work-group size. Both are set by build options,
+// chosen per device AND per kernel from CL_KERNEL_WORK_GROUP_SIZE (it can be lower than the
+// device maximum when a kernel needs many registers, e.g. on Mali and Adreno).
 const char* kSource = R"CLC(
+#ifndef T
 #define T 16
+#endif
+#ifndef WG1
+#define WG1 256
+#endif
 __kernel void sgemm(__global const float* A, __global const float* B, __global float* C,
                     __global const float* bias, uint M, uint K, uint N, uint mode) {
   __local float As[T][T];
@@ -138,14 +149,14 @@ __kernel void conv3x3(__global const float* A, __global const float* W, __global
   C[y * N + x] = s;
 }
 __kernel void reduce_pass(__global const float* A, __global float* C, uint n) {
-  __local float sm[256];
+  __local float sm[WG1];
   uint tid = get_local_id(0);
-  uint stride = get_num_groups(0) * 256;
+  uint stride = get_num_groups(0) * WG1;
   float s = 0.0f;
   for (uint i = get_global_id(0); i < n; i += stride) s += A[i];
   sm[tid] = s;
   barrier(CLK_LOCAL_MEM_FENCE);
-  for (uint o = 128; o > 0; o >>= 1) {
+  for (uint o = WG1 / 2; o > 0; o >>= 1) {
     if (tid < o) sm[tid] += sm[tid + o];
     barrier(CLK_LOCAL_MEM_FENCE);
   }
@@ -185,6 +196,7 @@ struct ClDevice {
   cl_context ctx = nullptr;
   cl_command_queue q = nullptr;
   size_t maxWg = 0;
+  cl_ulong localMem = 0;
   ~ClDevice() {
     if (q) api->ReleaseCommandQueue(q);
     if (ctx) api->ReleaseContext(ctx);
@@ -221,8 +233,7 @@ class ClExecution final : public Execution {
  public:
   explicit ClExecution(std::shared_ptr<ClDevice> d) : d_(std::move(d)), cl_(*d_->api) {}
   ~ClExecution() override {
-    for (auto k : kernels_) if (k) cl_.ReleaseKernel(k);
-    if (prog_) cl_.ReleaseProgram(prog_);
+    releaseProgram();
     for (auto m : {a_, b_, bias_, partial_, out_}) if (m) cl_.ReleaseMemObject(m);
   }
 
@@ -270,6 +281,101 @@ class ClExecution final : public Execution {
         break;
     }
 
+    // Work-group shapes, largest first; each must fit the device and the compiled kernel.
+    struct Shape { uint32_t t, wg1; };
+    static const Shape kShapes[] = {{16, 256}, {8, 128}, {8, 64}};
+    const bool twoD = p.kernel == Kernel::Sgemm || p.kernel == Kernel::Dense || p.kernel == Kernel::Conv3x3;
+    const char* kname = (p.kernel == Kernel::Conv3x3) ? "conv3x3" : (p.kernel == Kernel::Reduce) ? "reduce_pass"
+                        : (p.kernel == Kernel::Triad) ? "triad" : "sgemm";
+    std::string lastErr = "no work-group shape fits this device";
+    bool built = false;
+    for (const Shape& sh : kShapes) {
+      const size_t need = twoD ? size_t(sh.t) * sh.t : sh.wg1;
+      const cl_ulong lmemNeed = (p.kernel == Kernel::Sgemm || p.kernel == Kernel::Dense) ? 2ull * sh.t * sh.t * 4
+                                : (p.kernel == Kernel::Reduce) ? cl_ulong(sh.wg1) * 4 : 0;
+      if (d_->maxWg && need > d_->maxWg) continue;
+      if (d_->localMem && lmemNeed > d_->localMem) continue;
+      releaseProgram();
+      if (!buildProgram(sh.t, sh.wg1, &lastErr)) continue;
+      cl_int e = 0;
+      k1_ = cl_.CreateKernel(prog_, kname, &e);
+      if (!k1_ || e != CL_SUCCESS) { k1_ = nullptr; lastErr = "clCreateKernel(" + std::string(kname) + ") failed: " + std::to_string(e); continue; }
+      size_t kwg = 0;
+      if (cl_.GetKernelWorkGroupInfo(k1_, d_->dev, CL_KERNEL_WORK_GROUP_SIZE, sizeof kwg, &kwg, nullptr) != CL_SUCCESS) kwg = need;
+      if (kwg < need) {
+        lastErr = "kernel " + std::string(kname) + " allows only " + std::to_string(kwg) + " work-items per group";
+        HPC_LOGI("[CL] %s: CL_KERNEL_WORK_GROUP_SIZE=%zu < %zu, trying a smaller shape", kname, kwg, need);
+        continue;
+      }
+      if (p.kernel == Kernel::Reduce) {
+        k2_ = cl_.CreateKernel(prog_, kname, &e);
+        if (!k2_ || e != CL_SUCCESS) { k2_ = nullptr; lastErr = "clCreateKernel(reduce pass 2) failed: " + std::to_string(e); continue; }
+      }
+      tile_ = sh.t;
+      wg1_ = sh.wg1;
+      built = true;
+      break;
+    }
+    if (!built) {
+      if (err) *err = lastErr;
+      return false;
+    }
+    HPC_LOGI("[CL] %s: work-group shape %s", kname,
+             twoD ? (std::to_string(tile_) + "x" + std::to_string(tile_)).c_str() : std::to_string(wg1_).c_str());
+
+    auto arg = [&](cl_kernel k, cl_uint i, size_t sz, const void* v) { return cl_.SetKernelArg(k, i, sz, v) == CL_SUCCESS; };
+    auto roundUp = [](size_t v, size_t m) { return (v + m - 1) / m * m; };
+    bool ok = true;
+    switch (p.kernel) {
+      case Kernel::Sgemm: case Kernel::Dense: {
+        const cl_uint M = p.m, K = p.k, N = p.n, mode = p.kernel == Kernel::Dense ? 1u : 0u;
+        ok = arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &b_) && arg(k1_, 2, sizeof(cl_mem), &out_) &&
+             arg(k1_, 3, sizeof(cl_mem), &bias_) && arg(k1_, 4, 4, &M) && arg(k1_, 5, 4, &K) && arg(k1_, 6, 4, &N) &&
+             arg(k1_, 7, 4, &mode);
+        gws_[0] = roundUp(N, tile_); gws_[1] = roundUp(M, tile_); lws_[0] = lws_[1] = tile_; dims_ = 2;
+        break;
+      }
+      case Kernel::Conv3x3: {
+        const cl_uint M = p.m, N = p.n;
+        ok = arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &b_) && arg(k1_, 2, sizeof(cl_mem), &out_) &&
+             arg(k1_, 3, 4, &M) && arg(k1_, 4, 4, &N);
+        gws_[0] = roundUp(N, tile_); gws_[1] = roundUp(M, tile_); lws_[0] = lws_[1] = tile_; dims_ = 2;
+        break;
+      }
+      case Kernel::Reduce: {
+        const cl_uint n = p.n;
+        groups_ = std::min<uint32_t>(kGroups, std::max<uint32_t>(1, (p.n + wg1_ - 1) / wg1_));
+        const cl_uint n2 = groups_;
+        ok = arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &partial_) && arg(k1_, 2, 4, &n) &&
+             arg(k2_, 0, sizeof(cl_mem), &partial_) && arg(k2_, 1, sizeof(cl_mem), &out_) && arg(k2_, 2, 4, &n2);
+        gws_[0] = size_t(groups_) * wg1_; lws_[0] = wg1_; dims_ = 1;
+        break;
+      }
+      case Kernel::Triad: {
+        const cl_uint n = p.n;
+        const float alpha = p.alpha;
+        ok = arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &b_) && arg(k1_, 2, sizeof(cl_mem), &out_) &&
+             arg(k1_, 3, 4, &n) && arg(k1_, 4, 4, &alpha);
+        gws_[0] = size_t(std::min<uint32_t>(8192, std::max<uint32_t>(1, (p.n + wg1_ - 1) / wg1_))) * wg1_; lws_[0] = wg1_; dims_ = 1;
+        break;
+      }
+    }
+    if (!ok) {
+      if (err) *err = "failed to set OpenCL kernel arguments";
+      return false;
+    }
+    return true;
+  }
+
+  void releaseProgram() {
+    if (k1_) cl_.ReleaseKernel(k1_);
+    if (k2_) cl_.ReleaseKernel(k2_);
+    if (prog_) cl_.ReleaseProgram(prog_);
+    k1_ = k2_ = nullptr;
+    prog_ = nullptr;
+  }
+
+  bool buildProgram(uint32_t tile, uint32_t wg1, std::string* err) {
     cl_int e = 0;
     const char* src = kSource;
     prog_ = cl_.CreateProgramWithSource(d_->ctx, 1, &src, nullptr, &e);
@@ -278,7 +384,8 @@ class ClExecution final : public Execution {
       if (err) *err = "clCreateProgramWithSource failed: " + std::to_string(e);
       return false;
     }
-    e = cl_.BuildProgram(prog_, 1, &d_->dev, "", nullptr, nullptr);
+    const std::string opts = "-DT=" + std::to_string(tile) + " -DWG1=" + std::to_string(wg1);
+    e = cl_.BuildProgram(prog_, 1, &d_->dev, opts.c_str(), nullptr, nullptr);
     if (e != CL_SUCCESS) {
       size_t n = 0;
       cl_.GetProgramBuildInfo(prog_, d_->dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &n);
@@ -287,58 +394,8 @@ class ClExecution final : public Execution {
       if (n) cl_.GetProgramBuildInfo(prog_, d_->dev, CL_PROGRAM_BUILD_LOG, n, log.data(), nullptr);
       log.back() = '\0';
       const std::string cleanLog = sanitizeAscii(log.data(), 256);
-      HPC_LOGW("[CL] clBuildProgram failed (%d): %s", int(e), cleanLog.c_str());
+      HPC_LOGW("[CL] clBuildProgram(%s) failed (%d): %s", opts.c_str(), int(e), cleanLog.c_str());
       if (err) *err = "OpenCL build failed (" + std::to_string(e) + "): " + cleanLog;
-      return false;
-    }
-    auto mk = [&](const char* name) {
-      cl_kernel k = cl_.CreateKernel(prog_, name, &e);
-      kernels_.push_back(k);
-      return k;
-    };
-    auto arg = [&](cl_kernel k, cl_uint i, size_t sz, const void* v) { return cl_.SetKernelArg(k, i, sz, v) == CL_SUCCESS; };
-    bool ok = true;
-    switch (p.kernel) {
-      case Kernel::Sgemm: case Kernel::Dense: {
-        k1_ = mk("sgemm");
-        const cl_uint M = p.m, K = p.k, N = p.n, mode = p.kernel == Kernel::Dense ? 1u : 0u;
-        ok = k1_ && arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &b_) && arg(k1_, 2, sizeof(cl_mem), &out_) &&
-             arg(k1_, 3, sizeof(cl_mem), &bias_) && arg(k1_, 4, 4, &M) && arg(k1_, 5, 4, &K) && arg(k1_, 6, 4, &N) &&
-             arg(k1_, 7, 4, &mode);
-        gws_[0] = (N + 15) / 16 * 16; gws_[1] = (M + 15) / 16 * 16; lws_[0] = lws_[1] = 16; dims_ = 2;
-        break;
-      }
-      case Kernel::Conv3x3: {
-        k1_ = mk("conv3x3");
-        const cl_uint M = p.m, N = p.n;
-        ok = k1_ && arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &b_) && arg(k1_, 2, sizeof(cl_mem), &out_) &&
-             arg(k1_, 3, 4, &M) && arg(k1_, 4, 4, &N);
-        gws_[0] = (N + 15) / 16 * 16; gws_[1] = (M + 15) / 16 * 16; lws_[0] = lws_[1] = 16; dims_ = 2;
-        break;
-      }
-      case Kernel::Reduce: {
-        k1_ = mk("reduce_pass");
-        k2_ = mk("reduce_pass");
-        const cl_uint n = p.n;
-        groups_ = std::min<uint32_t>(kGroups, std::max<uint32_t>(1, (p.n + 255) / 256));
-        const cl_uint n2 = groups_;
-        ok = k1_ && k2_ && arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &partial_) && arg(k1_, 2, 4, &n) &&
-             arg(k2_, 0, sizeof(cl_mem), &partial_) && arg(k2_, 1, sizeof(cl_mem), &out_) && arg(k2_, 2, 4, &n2);
-        gws_[0] = size_t(groups_) * 256; lws_[0] = 256; dims_ = 1;
-        break;
-      }
-      case Kernel::Triad: {
-        k1_ = mk("triad");
-        const cl_uint n = p.n;
-        const float alpha = p.alpha;
-        ok = k1_ && arg(k1_, 0, sizeof(cl_mem), &a_) && arg(k1_, 1, sizeof(cl_mem), &b_) && arg(k1_, 2, sizeof(cl_mem), &out_) &&
-             arg(k1_, 3, 4, &n) && arg(k1_, 4, 4, &alpha);
-        gws_[0] = size_t(std::min<uint32_t>(8192, std::max<uint32_t>(1, (p.n + 255) / 256))) * 256; lws_[0] = 256; dims_ = 1;
-        break;
-      }
-    }
-    if (!ok) {
-      if (err) *err = "failed to create/configure OpenCL kernel";
       return false;
     }
     return true;
@@ -349,14 +406,22 @@ class ClExecution final : public Execution {
     cl_event e1 = nullptr, e2 = nullptr;
     cl_int r = cl_.EnqueueNDRangeKernel(d_->q, k1_, dims_, nullptr, gws_, lws_, 0, nullptr, &e1);
     if (r == CL_SUCCESS && k2_) {
-      const size_t g2 = 256, l2 = 256;
+      const size_t g2 = wg1_, l2 = wg1_;
       r = cl_.EnqueueNDRangeKernel(d_->q, k2_, 1, nullptr, &g2, &l2, 0, nullptr, &e2);
     }
     if (r != CL_SUCCESS) {
+      if (e1) cl_.ReleaseEvent(e1);
+      if (e2) cl_.ReleaseEvent(e2);
       if (err) *err = "clEnqueueNDRangeKernel failed: " + std::to_string(r);
       return false;
     }
-    cl_.Finish(d_->q);
+    r = cl_.Finish(d_->q);
+    if (r != CL_SUCCESS) {
+      if (e1) cl_.ReleaseEvent(e1);
+      if (e2) cl_.ReleaseEvent(e2);
+      if (err) *err = "clFinish failed: " + std::to_string(r);
+      return false;
+    }
     cl_event last = e2 ? e2 : e1;
     cl_ulong t0 = 0, t1 = 0;
     if (cl_.GetEventProfilingInfo(e1, CL_PROFILING_COMMAND_START, sizeof t0, &t0, nullptr) == CL_SUCCESS &&
@@ -385,8 +450,8 @@ class ClExecution final : public Execution {
   size_t outCount_ = 0;
   cl_mem a_ = nullptr, b_ = nullptr, bias_ = nullptr, partial_ = nullptr, out_ = nullptr;
   cl_program prog_ = nullptr;
-  std::vector<cl_kernel> kernels_;
   cl_kernel k1_ = nullptr, k2_ = nullptr;
+  uint32_t tile_ = 16, wg1_ = 256;
   size_t gws_[2] = {1, 1}, lws_[2] = {1, 1};
   cl_uint dims_ = 1;
   uint32_t groups_ = 1;
@@ -411,6 +476,12 @@ class OpenCLBackend final : public Backend {
     cl_bool unified = 0;
     if (cl.GetDeviceInfo(dev, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof unified, &unified, nullptr) != CL_SUCCESS) unified = 0;
     d_->maxWg = wg;
+    // Test hook: cap the work-group size to exercise the smaller-shape fallback on any runtime.
+    if (const char* cap = std::getenv("HPC_TEST_CL_MAX_WG")) {
+      const unsigned long c = std::strtoul(cap, nullptr, 10);
+      if (c > 0 && c < d_->maxWg) d_->maxWg = c;
+    }
+    d_->localMem = lmem;
 
     const std::string devVer = infoStr(cl, dev, CL_DEVICE_VERSION, 256);
     const std::string exts = infoStr(cl, dev, CL_DEVICE_EXTENSIONS, 4096);
@@ -420,11 +491,12 @@ class OpenCLBackend final : public Backend {
     info_.vendor = infoStr(cl, dev, CL_DEVICE_VENDOR, 256);
     info_.driver = infoStr(cl, dev, CL_DRIVER_VERSION, 256);
     info_.kernels.assign(std::begin(kAllKernels), std::end(kAllKernels));
-    info_.available = dev != nullptr && wg >= 256 && lmem >= 4096;
-    if (!info_.available) info_.note = "needs work-group size >= 256 and >= 4 KiB local memory";
+    info_.available = dev != nullptr && wg >= 64 && lmem >= 512;
+    if (!info_.available) info_.note = "needs work-group size >= 64 and >= 512 B local memory";
     auto& dt = info_.detail;
     dt["platform"] = pname;
     dt["device_type"] = (type & CL_DEVICE_TYPE_GPU) ? "gpu" : (type & CL_DEVICE_TYPE_CPU) ? "cpu" : (type & CL_DEVICE_TYPE_ACCELERATOR) ? "accelerator" : "other";
+    info_.deviceClass = (type & CL_DEVICE_TYPE_GPU) ? "gpu" : (type & CL_DEVICE_TYPE_CPU) ? "cpu" : (type & CL_DEVICE_TYPE_ACCELERATOR) ? "npu" : "other";
     dt["compute_units"] = std::to_string(cu);
     dt["max_work_group_size"] = std::to_string(wg);
     dt["local_mem_bytes"] = std::to_string(lmem);

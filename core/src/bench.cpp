@@ -15,7 +15,10 @@
 
 namespace hpc {
 
-const char* versionString() { return "0.1.1"; }
+#ifndef HPC_VERSION
+#define HPC_VERSION "0.0.0-unversioned"
+#endif
+const char* versionString() { return HPC_VERSION; }
 
 uint32_t presetSize(const std::string& preset, Kernel k) {
   // Sizes keep peak RAM (problem + fp64 reference + device copies) modest on phones.
@@ -26,17 +29,27 @@ uint32_t presetSize(const std::string& preset, Kernel k) {
   return t[int(k)];
 }
 
+bool backendMatches(const std::string& id, const std::vector<std::string>& filters) {
+  if (filters.empty()) return true;
+  for (const auto& s : filters)
+    if (id == s || id.rfind(s + ":", 0) == 0) return true;
+  return false;
+}
+
+bool plausibleDeviceTime(double devMs, double wallMs) {
+  if (!(devMs > 0) || !std::isfinite(devMs) || !std::isfinite(wallMs)) return false;
+  if (devMs > wallMs * 1.05 + 0.05) return false;
+  return devMs >= wallMs * 0.02;
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
 double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
 
-bool matches(const BackendInfo& i, const std::vector<std::string>& f) {
-  if (f.empty()) return true;
-  for (const auto& s : f)
-    if (i.id == s || i.id.rfind(s + ":", 0) == 0 || i.id.rfind(s, 0) == 0) return true;
-  return false;
-}
+bool matches(const BackendInfo& i, const std::vector<std::string>& f) { return backendMatches(i.id, f); }
+
+
 
 std::string platformName() {
 #if defined(__ANDROID__)
@@ -204,6 +217,7 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
 
       bool good = true;
       std::vector<double> wall, dev;
+      size_t devReported = 0, devRejected = 0;
       std::vector<float> out;
       bool readOk = false;
       setBreadcrumb(runBegin);
@@ -215,8 +229,13 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
           double d = -1;
           auto s = Clock::now();
           good = ex->run(&d, &err);
-          wall.push_back(msSince(s));
-          if (d >= 0) dev.push_back(d);
+          const double w = msSince(s);
+          wall.push_back(w);
+          if (d >= 0) {
+            ++devReported;
+            if (plausibleDeviceTime(d, w)) dev.push_back(d);
+            else ++devRejected;
+          }
           if (cancelled()) break;
         }
         if (good) {
@@ -255,6 +274,13 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
       r.maxRelErr = v.maxRelErr;
       r.zeroCopy = ex->zeroCopy();
       r.wallMs = computeStats(wall);
+      // One implausible device sample discredits the timer for the whole run: report none.
+      if (devRejected) {
+        r.devRejected = devRejected;
+        dev.clear();
+        HPC_LOGW("[BENCH] %s %s: discarded the device timer (%zu of %zu samples inconsistent with wall time); using wall time",
+                 bi.id.c_str(), kName, devRejected, devReported);
+      }
       r.devMs = computeStats(dev);
       const bool useDev = r.devMs.count == wall.size() && r.devMs.count > 0 && r.devMs.median > 0;
       const double t = (useDev ? r.devMs.median : r.wallMs.median) * 1e-3;
@@ -269,12 +295,15 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
         HPC_LOGI("[BENCH] result ok: backend=%s kernel=%s size=%s wallMed=%.3fms devMed=%.3fms GFLOP/s=%.2f GB/s=%.2f maxAbsErr=%g",
                  bi.id.c_str(), kName, r.size.c_str(), r.wallMs.median, r.devMs.median, r.gflops, r.gbps, r.maxAbsErr);
       }
-      if (k == Kernel::Sgemm && v.ok && bi.genuine) okSgemm.push_back({bi.id, r.wallMs.median});
+      // Split partners: the CPU backend itself, and real GPUs/NPUs (not CPU-hosted runtimes such as
+      // llvmpipe or PoCL, which would just compete with the CPU half for the same cores).
+      if (k == Kernel::Sgemm && v.ok && bi.genuine && (bi.id == "cpu" || bi.deviceClass == "gpu" || bi.deviceClass == "npu"))
+        okSgemm.push_back({bi.id, r.wallMs.median});
       rep.results.push_back(r);
     }
 
     // ---- heterogeneous split: CPU rows + GPU rows of one SGEMM, run concurrently ----
-    if (k == Kernel::Sgemm && cfg.hetero && !cancelled()) {
+    if (k == Kernel::Sgemm && cfg.hetero && !cancelled() && !rep.cancelled) {
       double cpuMed = 0;
       std::string gpuId;
       double gpuMed = 1e300;
@@ -285,7 +314,9 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
       HeteroResult& h = rep.hetero;
       h.size = p.sizeLabel();
       if (cpuMed <= 0 || gpuId.empty()) {
-        h.error = "needs a verified CPU run and a verified GPU/accelerator run of sgemm";
+        h.error = "needs a verified CPU run and a verified GPU/NPU run of sgemm (CPU-hosted runtimes do not count)";
+      } else if (p.m < 8) {
+        h.error = "problem too small to split (needs >= 8 rows)";
       } else {
         say("Heterogeneous split: cpu + " + gpuId);
         Backend* gpuB = nullptr;
@@ -309,8 +340,10 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
           auto gx = gpuB ? gpuB->prepare(pg, popt, &e2) : nullptr;
           setBreadcrumb("prepare:" + gpuId + ":sgemm:end");
           h.gpuId = sanitizeAscii(gpuId); h.cpuRows = mc; h.gpuRows = p.m - mc;
+          if (gpuB) h.gpuDevice = sanitizeAscii(gpuB->info().device);
           h.cpuAloneMs = cpuMed; h.gpuAloneMs = gpuMed;
           if (!cx || !gx) {
+            rep.allVerified = false;  // an attempted run that did not produce a verified result
             h.error = sanitizeAscii("prepare failed: " + e1 + " " + e2);
             HPC_LOGW("[BENCH] hetero prepare failed: %s", h.error.c_str());
           } else {
@@ -322,9 +355,14 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
               return c1 && g1;
             };
             setBreadcrumb("run:" + gpuId + ":sgemm:begin");
-            for (int i = 0; i < cfg.warmup && good; ++i) good = once();
+            for (int i = 0; i < cfg.warmup && good && !cancelled(); ++i) good = once();
             std::vector<double> wall;
-            for (int i = 0; i < cfg.iterations && good; ++i) { auto s = Clock::now(); good = once(); wall.push_back(msSince(s)); }
+            for (int i = 0; i < cfg.iterations && good && !cancelled(); ++i) {
+              auto s = Clock::now();
+              good = once();
+              wall.push_back(msSince(s));
+            }
+            if (wall.empty()) good = false;  // cancelled before a single timed run
             std::vector<float> oc, og;
             const bool readBoth = good && cx->read(oc, &e1) && gx->read(og, &e2);
             setBreadcrumb("run:" + gpuId + ":sgemm:end");
@@ -337,21 +375,27 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
               if (!v.ok) rep.allVerified = false;
               HPC_LOGI("[BENCH] hetero sgemm done: cpuRows=%u gpuRows=%u wallMed=%.3fms speedup=%.2fx verified=%d",
                        h.cpuRows, h.gpuRows, h.wallMs.median, h.speedupVsBest, h.verified ? 1 : 0);
+            } else if (cancelled()) {
+              h.error = "cancelled";
             } else {
+              rep.allVerified = false;
               h.error = sanitizeAscii("run/read failed: " + e1 + " " + e2);
               HPC_LOGW("[BENCH] hetero run/read failed: %s", h.error.c_str());
             }
           }
         } catch (const std::exception& e) {
+          rep.allVerified = false;
           h.error = sanitizeAscii(std::string("hetero exception: ") + e.what());
           HPC_LOGE("[BENCH] %s", h.error.c_str());
         } catch (...) {
+          rep.allVerified = false;
           h.error = "hetero unknown exception";
           HPC_LOGE("[BENCH] %s", h.error.c_str());
         }
       }
     }
   }
+  if (cancelled()) rep.cancelled = true;  // also when cancel arrived during the last job
   // Destroy backends on this thread (GL contexts are thread-bound).
   backends.clear();
   HPC_LOGI("[BENCH] runBenchmarks finished (allVerified=%d, cancelled=%d)",
@@ -362,7 +406,7 @@ Report runBenchmarks(const BenchConfig& cfg, const ProgressFn& progress, std::at
 // ---------------------------------------------------------------------------------------------
 std::string toJson(const Report& r) {
   std::ostringstream o;
-  o << "{\n  \"version\":\"" << r.version << "\",\"platform\":\"" << r.platform << "\",\"preset\":\"" << jsonEsc(r.preset)
+  o << "{\n  \"version\":\"" << jsonEsc(r.version) << "\",\"platform\":\"" << r.platform << "\",\"preset\":\"" << jsonEsc(r.preset)
     << "\",\"warmup\":" << r.warmup << ",\"iterations\":" << r.iterations << ",\"all_verified\":" << (r.allVerified ? "true" : "false")
     << ",\"cancelled\":" << (r.cancelled ? "true" : "false") << ",\n";
   o << "  \"cpu\":{\"arch\":\"" << jsonEsc(r.cpu.arch) << "\",\"cores\":" << r.cpu.logicalCores << ",\"big_cores\":" << r.cpu.bigCores.size()
@@ -371,7 +415,7 @@ std::string toJson(const Report& r) {
   for (size_t i = 0; i < r.backends.size(); ++i) {
     const auto& b = r.backends[i];
     o << (i ? ",\n    " : "\n    ") << "{\"id\":\"" << jsonEsc(b.id) << "\",\"api\":\"" << jsonEsc(b.api) << "\",\"device\":\"" << jsonEsc(b.device)
-      << "\",\"vendor\":\"" << jsonEsc(b.vendor) << "\",\"driver\":\"" << jsonEsc(b.driver) << "\",\"available\":" << (b.available ? "true" : "false")
+      << "\",\"vendor\":\"" << jsonEsc(b.vendor) << "\",\"driver\":\"" << jsonEsc(b.driver) << "\",\"device_class\":\"" << jsonEsc(b.deviceClass) << "\",\"available\":" << (b.available ? "true" : "false")
       << ",\"genuine\":" << (b.genuine ? "true" : "false") << ",\"note\":\"" << jsonEsc(b.note) << "\",\"detail\":{";
     bool first = true;
     for (const auto& kv : b.detail) { o << (first ? "" : ",") << "\"" << jsonEsc(kv.first) << "\":\"" << jsonEsc(kv.second) << "\""; first = false; }
@@ -383,12 +427,12 @@ std::string toJson(const Report& r) {
     o << (i ? ",\n    " : "\n    ") << "{\"backend\":\"" << jsonEsc(k.backendId) << "\",\"device\":\"" << jsonEsc(k.device) << "\",\"genuine\":" << (k.genuine ? "true" : "false")
       << ",\"kernel\":\"" << k.kernel << "\",\"size\":\"" << k.size << "\",\"ran\":" << (k.ran ? "true" : "false") << ",\"verified\":" << (k.verified ? "true" : "false")
       << ",\"error\":\"" << jsonEsc(k.error) << "\",\"prepare_ms\":" << num(k.prepareMs) << ",\"wall_ms\":" << statsJson(k.wallMs) << ",\"device_ms\":" << statsJson(k.devMs)
-      << ",\"time_basis\":\"" << k.timeBasis << "\",\"gflops\":" << num(k.gflops) << ",\"gbps\":" << num(k.gbps) << ",\"flops\":" << num(k.flops) << ",\"bytes\":" << num(k.bytes)
+      << ",\"device_samples_rejected\":" << k.devRejected << ",\"time_basis\":\"" << k.timeBasis << "\",\"gflops\":" << num(k.gflops) << ",\"gbps\":" << num(k.gbps) << ",\"flops\":" << num(k.flops) << ",\"bytes\":" << num(k.bytes)
       << ",\"arithmetic_intensity\":" << num(k.bytes > 0 ? k.flops / k.bytes : 0) << ",\"max_abs_err\":" << num(k.maxAbsErr) << ",\"max_rel_err\":" << num(k.maxRelErr)
       << ",\"zero_copy\":" << (k.zeroCopy ? "true" : "false") << "}";
   }
   const auto& h = r.hetero;
-  o << "\n  ],\n  \"hetero\":{\"ran\":" << (h.ran ? "true" : "false") << ",\"error\":\"" << jsonEsc(h.error) << "\",\"kernel\":\"sgemm\",\"size\":\"" << h.size << "\",\"gpu\":\"" << jsonEsc(h.gpuId)
+  o << "\n  ],\n  \"hetero\":{\"ran\":" << (h.ran ? "true" : "false") << ",\"error\":\"" << jsonEsc(h.error) << "\",\"kernel\":\"sgemm\",\"size\":\"" << h.size << "\",\"gpu\":\"" << jsonEsc(h.gpuId) << "\",\"gpu_device\":\"" << jsonEsc(h.gpuDevice)
     << "\",\"cpu_rows\":" << h.cpuRows << ",\"gpu_rows\":" << h.gpuRows << ",\"wall_ms\":" << statsJson(h.wallMs) << ",\"cpu_alone_ms\":" << num(h.cpuAloneMs)
     << ",\"gpu_alone_ms\":" << num(h.gpuAloneMs) << ",\"speedup_vs_best_single\":" << num(h.speedupVsBest) << ",\"verified\":" << (h.verified ? "true" : "false")
     << ",\"max_abs_err\":" << num(h.maxAbsErr) << "}\n}\n";
@@ -417,9 +461,10 @@ std::string toText(const Report& r) {
     o << line;
     for (const auto& k : r.results) {
       if (!k.ran) { snprintf(line, sizeof line, "%-10s %-8s %-14s  FAILED: %s\n", k.backendId.c_str(), k.kernel.c_str(), k.size.c_str(), k.error.c_str()); o << line; continue; }
-      std::string dev = k.devMs.count ? num(k.devMs.median) : "-";
+      char dev[32] = "-";
+      if (k.timeBasis == "device") snprintf(dev, sizeof dev, "%.3f", k.devMs.median);
       snprintf(line, sizeof line, "%-10s %-8s %-14s %10.3f %10s %9.2f %8.2f %-5s %.3g%s\n", k.backendId.c_str(), k.kernel.c_str(), k.size.c_str(), k.wallMs.median,
-               dev.c_str(), k.gflops, k.gbps, k.verified ? "yes" : "NO", k.maxAbsErr, k.genuine ? "" : "  (shim)");
+               dev, k.gflops, k.gbps, k.verified ? "yes" : "NO", k.maxAbsErr, k.genuine ? "" : "  (shim)");
       o << line;
     }
   }
@@ -431,6 +476,11 @@ std::string toText(const Report& r) {
   } else if (!h.error.empty()) {
     o << "\nHeterogeneous split not run: " << h.error << "\n";
   }
+  bool anyDevRejected = false;
+  for (const auto& k : r.results) anyDevRejected |= k.devRejected > 0;
+  if (anyDevRejected)
+    o << "\n\"dev ms\" is '-' where the device timer was inconsistent with wall time and was discarded.\n";
+  if (r.cancelled) o << "\nCancelled: the results above are partial.\n";
   o << "\nAll attempted runs verified against fp64 reference: " << (r.allVerified ? "yes" : "NO") << "\n";
   return o.str();
 }

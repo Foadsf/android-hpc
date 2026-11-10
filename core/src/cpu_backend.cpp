@@ -199,6 +199,7 @@ class CpuBackend final : public Backend {
                                  std::to_string(ci.logicalCores) + " cores used");
     info_.vendor = sanitizeAscii(ci.arch);
     info_.driver = "portable C++17, auto-vectorised";
+    info_.deviceClass = "cpu";
     info_.available = true;
     info_.kernels.assign(std::begin(kAllKernels), std::end(kAllKernels));
     info_.detail["isa"] = sanitizeAscii(ci.isa);

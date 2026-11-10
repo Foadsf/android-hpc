@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+#include <cstdio>
 #include <memory>
 #include <string>
 
@@ -32,6 +33,18 @@ inline std::string vendorName(uint32_t id) {
     case 0x1AE0: return "Google (SwiftShader)";
     case 0x144D: return "Samsung";
     case 0x14E4: return "Broadcom";
+    case 0x106B: return "Apple";
+    case 0x1414: return "Microsoft";
+    case 0x19E5: return "Huawei";
+    case 0x1D17: return "Zhaoxin";
+    // Khronos-registered vendor ids (VkVendorId) for vendors without a PCI id
+    case 0x10001: return "Vivante";
+    case 0x10002: return "VeriSilicon";
+    case 0x10003: return "Kazan";
+    case 0x10004: return "Codeplay";
+    case 0x10005: return "Mesa";
+    case 0x10006: return "PoCL";
+    case 0x10007: return "Mobileye";
     default: {
       char b[24];
       snprintf(b, sizeof b, "0x%04X", id);

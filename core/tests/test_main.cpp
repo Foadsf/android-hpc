@@ -6,6 +6,7 @@
 #include <string>
 
 #include "hpc/backend.hpp"
+#include "hpc/bench.hpp"
 #include "hpc/reference.hpp"
 
 using namespace hpc;
@@ -47,6 +48,24 @@ static void testVerifierRejectsCorruption() {
   CHECK(!verify(p, ref, shortv).ok, "wrong length must be rejected");
 }
 
+static void testBackendFilter() {
+  CHECK(backendMatches("vulkan:0", {}), "empty filter selects everything");
+  CHECK(backendMatches("vulkan:1", {"vulkan"}), "family selects its members");
+  CHECK(backendMatches("opencl:1", {"opencl:1"}), "exact id");
+  CHECK(!backendMatches("opencl:10", {"opencl:1"}), "opencl:1 must not select opencl:10");
+  CHECK(!backendMatches("cpu", {"c"}), "a bare prefix must not match");
+  CHECK(!backendMatches("sycl-shim", {"sycl"}), "sycl must not select sycl-shim");
+}
+
+static void testDeviceTimePlausibility() {
+  CHECK(plausibleDeviceTime(4.5, 5.0), "normal GPU time accepted");
+  CHECK(!plausibleDeviceTime(0.0002, 5.0), "Mali-style 200 ns for a 5 ms run rejected");
+  CHECK(!plausibleDeviceTime(0.0015, 2.0), "1.5 us for a 2 ms run rejected (old 1 us cut-off let it through)");
+  CHECK(!plausibleDeviceTime(9.0, 5.0), "device time longer than wall time rejected");
+  CHECK(!plausibleDeviceTime(-1, 5.0), "missing device time rejected");
+  CHECK(plausibleDeviceTime(0.02, 0.08), "short kernel with launch overhead accepted");
+}
+
 static void runCase(Backend& b, const Problem& p, const char* label) {
   if (!b.supports(p.kernel)) return;
   std::string err;
@@ -67,6 +86,8 @@ static void runCase(Backend& b, const Problem& p, const char* label) {
 int main() {
   testStats();
   testVerifierRejectsCorruption();
+  testBackendFilter();
+  testDeviceTimePlausibility();
 
   DiscoverOptions dopt;
   auto backends = discoverBackends(dopt);

@@ -252,6 +252,7 @@ void discoverNnapi(std::vector<std::unique_ptr<Backend>>& out) {
         BackendInfo i = base("nnapi:" + std::to_string(d));
         i.device = safeName.empty() ? "unknown" : safeName;
         i.detail["device_type"] = (type >= 0 && type < 5) ? tn[type] : "unknown";
+        i.deviceClass = type == 2 ? "cpu" : type == 3 ? "gpu" : type == 4 ? "npu" : "other";
         int64_t fl = 0;
         int rcFl = -1;
         if (api->deviceGetFeatureLevel) {

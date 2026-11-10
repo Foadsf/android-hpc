@@ -15,6 +15,10 @@ struct BackendInfo {
   std::string device;  // device / runtime name
   std::string vendor;
   std::string driver;
+  // What the silicon is, as the API reports it: "cpu", "gpu", "npu" (NPU/DSP/other accelerator)
+  // or "other". Used to pick a real GPU/NPU partner for the CPU+GPU split (a software rasteriser
+  // such as llvmpipe or a CPU OpenCL runtime is a CPU, not a GPU).
+  std::string deviceClass = "other";
   bool available = false;
   std::string note;                           // why unavailable, or caveats
   std::map<std::string, std::string> detail;  // free-form capability probes
