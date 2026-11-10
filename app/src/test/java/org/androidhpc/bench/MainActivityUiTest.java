@@ -164,6 +164,17 @@ public class MainActivityUiTest {
         screenshot(a, "empty-no-native");
     }
 
+    /**
+     * Regression: with ScrollView.setFillViewport(true), content shorter than the window was
+     * re-measured to the window height and the option switches collapsed to 27 dp (seen in CI,
+     * where the empty state fit on screen). Tall window = content always shorter than it.
+     */
+    @Test @Config(qualifiers = "w411dp-h1600dp-xxhdpi")
+    public void touchTargetsHoldWhenContentIsShorterThanTheWindow() throws Exception {
+        MainActivity a = launch();
+        assertTouchTargets(a.getWindow().getDecorView(), a.getResources().getDisplayMetrics().density);
+    }
+
     @Test public void formatting() {
         assertEquals("123", ReportRenderer.fmt(123.4).replace(',', '.'));
         assertEquals("12.3", ReportRenderer.fmt(12.34).replace(',', '.'));

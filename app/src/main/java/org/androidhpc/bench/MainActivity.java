@@ -161,7 +161,6 @@ public class MainActivity extends Activity {
 
     private void buildUi() {
         ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
         scroll.setClipToPadding(false);
         scroll.setBackgroundColor(ui.bg);
         final LinearLayout content = ui.vertical();
