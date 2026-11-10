@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.22)
-project(android_hpc LANGUAGES C CXX)
+# Single source of the version: the native report, hpc_cli and the APK (app/build.gradle reads it).
+project(android_hpc VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

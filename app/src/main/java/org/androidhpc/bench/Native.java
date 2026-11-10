@@ -29,10 +29,10 @@ final class Native {
     /** Set comma-separated backend families (vulkan, opencl, gles, nnapi) to skip. */
     static native void setDisabledBackends(String csv);
 
-    /** Probe every backend; returns the human-readable report. */
+    /** Probe every backend; returns the JSON report (backends only). {@link #lastText()} has the text form. */
     static native String discover(boolean bigOnly);
 
-    /** Run the suite; returns the JSON report. */
+    /** Run the suite; returns the JSON report, or {"error":...}. Only one discover/run executes at a time. */
     static native String run(String preset, int warmup, int iters, String backendsCsv, String kernelsCsv,
                              boolean zeroCopy, boolean hetero, boolean bigOnly);
 

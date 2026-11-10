@@ -2,6 +2,14 @@ plugins {
     id 'com.android.application'
 }
 
+// The version has one source: project(... VERSION x.y.z) in the root CMakeLists.txt, which the
+// native report and hpc_cli also use, so the APK and its reports can never disagree.
+def hpcVersion() {
+    def m = (file('../CMakeLists.txt').text =~ /project\(android_hpc\s+VERSION\s+([0-9.]+)/)
+    if (!m.find()) throw new GradleException('version not found in CMakeLists.txt')
+    return m.group(1)
+}
+
 android {
     namespace 'org.androidhpc.bench'
     compileSdk 35
@@ -11,8 +19,8 @@ android {
         applicationId 'org.androidhpc.bench'
         minSdk 26            // AHardwareBuffer NDK API; Vulkan/GLES/EGL are older
         targetSdk 35
-        versionCode 4
-        versionName '0.1.3'
+        versionCode 5
+        versionName hpcVersion()
 
         ndk {
             // arm64 is the real target; x86_64 lets the app run on emulators/Chromebooks.
@@ -47,4 +55,22 @@ android {
     lint {
         abortOnError false
     }
+    testOptions {
+        // UI smoke tests run the real Activity on Robolectric's Android framework (no device).
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            systemProperty 'robolectric.graphicsMode', 'NATIVE'
+            systemProperty 'hpc.screenshotDir', "${buildDir}/ui-screenshots"
+            // Robolectric downloads its Android framework jar from Maven Central at test time;
+            // -ProbolectricRepo=<maven mirror URL> points it elsewhere (e.g. when rate-limited).
+            if (project.hasProperty('robolectricRepo')) {
+                systemProperty 'robolectric.dependency.repo.url', project.property('robolectricRepo')
+            }
+        }
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
 }

@@ -95,6 +95,7 @@ class SyclBackend final : public Backend {
     info_.device = "CPU thread pool";
     info_.vendor = "-";
     info_.driver = "hpc::sycl_shim";
+    info_.deviceClass = "cpu";
     info_.available = true;
     info_.genuine = false;
     info_.note =

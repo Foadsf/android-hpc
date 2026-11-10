@@ -15,7 +15,8 @@
 #include "hpc/log.hpp"
 
 namespace {
-std::mutex gMu;
+std::mutex gMu;        // guards the strings below (held only briefly)
+std::mutex gWorkMu;    // one discover/run at a time, even if the Activity is recreated mid-run
 std::string gProgress, gLastText, gLastJson;
 std::atomic<bool> gCancel{false};
 
@@ -40,6 +41,18 @@ std::vector<std::string> split(const std::string& s) {
   while (std::getline(ss, t, ','))
     if (!t.empty()) v.push_back(t);
   return v;
+}
+
+// {"error":"..."} with the message sanitised and JSON-escaped (driver text may contain quotes).
+std::string errorJson(const std::string& raw) {
+  std::string o = "{\"error\":\"";
+  for (char c : hpc::sanitizeAscii(raw, 400)) {
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n') o += "\\n";
+    else if (c == '\t') o += "\\t";
+    else o += c;
+  }
+  return o + "\"}";
 }
 
 void setProgress(const std::string& s) {
@@ -100,6 +113,7 @@ JNIEXPORT void JNICALL Java_org_androidhpc_bench_Native_setDisabledBackends(JNIE
 
 JNIEXPORT jstring JNICALL Java_org_androidhpc_bench_Native_discover(JNIEnv* env, jclass, jboolean bigOnly) {
   try {
+    std::lock_guard<std::mutex> work(gWorkMu);
     HPC_LOGI("JNI discover(bigOnly=%d) begin", int(bigOnly != JNI_FALSE));
     hpc::DiscoverOptions o;
     o.cpuBigCoresOnly = bigOnly != JNI_FALSE;
@@ -112,19 +126,31 @@ JNIEXPORT jstring JNICALL Java_org_androidhpc_bench_Native_discover(JNIEnv* env,
       gLastJson = json;
     }
     HPC_LOGI("JNI discover complete (%zu backends)", r.backends.size());
-    return safeJString(env, text);
+    return safeJString(env, json);
   } catch (const std::exception& e) {
     HPC_LOGE("JNI discover failed with std::exception: %s", e.what());
-    return safeJString(env, std::string("discovery failed: ") + e.what());
+    const std::string msg = "discovery failed: " + hpc::sanitizeAscii(e.what(), 400);
+    std::lock_guard<std::mutex> lk(gMu);
+    gLastText = msg;
+    gLastJson = errorJson(e.what());
+    return safeJString(env, gLastJson);
   } catch (...) {
     HPC_LOGE("JNI discover failed with unknown C++ exception");
-    return safeJString(env, "discovery failed: unknown C++ exception");
+    std::lock_guard<std::mutex> lk(gMu);
+    gLastText = "discovery failed: unknown C++ exception";
+    gLastJson = "{\"error\":\"unknown C++ exception\"}";
+    return safeJString(env, gLastJson);
   }
 }
 
 JNIEXPORT jstring JNICALL Java_org_androidhpc_bench_Native_run(JNIEnv* env, jclass, jstring preset, jint warmup,
                                                                jint iters, jstring backends, jstring kernels,
                                                                jboolean zeroCopy, jboolean hetero, jboolean bigOnly) {
+  std::unique_lock<std::mutex> work(gWorkMu, std::try_to_lock);
+  if (!work.owns_lock()) {
+    HPC_LOGW("JNI run rejected: another discover/run is in progress");
+    return safeJString(env, "{\"error\":\"another benchmark run is already in progress\"}");
+  }
   try {
     hpc::BenchConfig cfg;
     cfg.preset = str(env, preset);
@@ -154,7 +180,7 @@ JNIEXPORT jstring JNICALL Java_org_androidhpc_bench_Native_run(JNIEnv* env, jcla
   } catch (const std::exception& e) {
     HPC_LOGE("JNI run failed with std::exception: %s", e.what());
     std::string errText = std::string("benchmark failed: ") + hpc::sanitizeAscii(e.what(), 512);
-    std::string errJson = "{\"error\":\"" + hpc::sanitizeAscii(e.what(), 512) + "\"}";
+    std::string errJson = errorJson(e.what());
     std::lock_guard<std::mutex> lk(gMu);
     gLastText = errText;
     gLastJson = errJson;

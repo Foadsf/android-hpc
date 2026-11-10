@@ -65,6 +65,13 @@ jobs:
           exit 1
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
+      - name: UI tests (Robolectric; renders a real report, checks touch targets, writes screenshots)
+        run: ./gradlew --no-daemon testDebugUnitTest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots
+          path: app/build/ui-screenshots
       - name: Verify the APK declares what it must
         run: |
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging app/build/outputs/apk/debug/app-debug.apk | tee badging.txt

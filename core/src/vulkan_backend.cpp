@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <set>
 
 #include "backend_util.hpp"
@@ -66,7 +67,27 @@ struct DevFns {
 #endif
 };
 
-std::string vkr(VkResult r) { return "VkResult " + std::to_string(int(r)); }
+std::string vkr(VkResult r) {
+  const char* n = nullptr;
+  switch (r) {
+    case VK_NOT_READY: n = "VK_NOT_READY"; break;
+    case VK_TIMEOUT: n = "VK_TIMEOUT"; break;
+    case VK_INCOMPLETE: n = "VK_INCOMPLETE"; break;
+    case VK_ERROR_OUT_OF_HOST_MEMORY: n = "VK_ERROR_OUT_OF_HOST_MEMORY"; break;
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: n = "VK_ERROR_OUT_OF_DEVICE_MEMORY"; break;
+    case VK_ERROR_INITIALIZATION_FAILED: n = "VK_ERROR_INITIALIZATION_FAILED"; break;
+    case VK_ERROR_DEVICE_LOST: n = "VK_ERROR_DEVICE_LOST"; break;
+    case VK_ERROR_MEMORY_MAP_FAILED: n = "VK_ERROR_MEMORY_MAP_FAILED"; break;
+    case VK_ERROR_LAYER_NOT_PRESENT: n = "VK_ERROR_LAYER_NOT_PRESENT"; break;
+    case VK_ERROR_EXTENSION_NOT_PRESENT: n = "VK_ERROR_EXTENSION_NOT_PRESENT"; break;
+    case VK_ERROR_FEATURE_NOT_PRESENT: n = "VK_ERROR_FEATURE_NOT_PRESENT"; break;
+    case VK_ERROR_INCOMPATIBLE_DRIVER: n = "VK_ERROR_INCOMPATIBLE_DRIVER"; break;
+    case VK_ERROR_TOO_MANY_OBJECTS: n = "VK_ERROR_TOO_MANY_OBJECTS"; break;
+    case VK_ERROR_FORMAT_NOT_SUPPORTED: n = "VK_ERROR_FORMAT_NOT_SUPPORTED"; break;
+    default: break;
+  }
+  return n ? std::string(n) : "VkResult " + std::to_string(int(r));
+}
 
 struct Runtime {
   DynLib lib;
@@ -286,7 +307,9 @@ class Gpu {
     std::vector<const char*> exts;
 #if defined(__ANDROID__)
     const auto have = deviceExtensions(*rt, pd);
-    if (rt->apiVersion >= VK_API_VERSION_1_1 && have.count(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
+    // The AHB import extension depends on Vulkan 1.1 functionality: both the instance and the
+    // physical device must be 1.1+ (a 1.0 device would need every KHR dependency enabled).
+    if (rt->apiVersion >= VK_API_VERSION_1_1 && props.apiVersion >= VK_API_VERSION_1_1 && have.count(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
         have.count(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
       exts.push_back(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
       exts.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
@@ -450,8 +473,13 @@ class Gpu {
     fn(cb);
     d.vkEndCommandBuffer(cb);
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence;
-    d.vkCreateFence(dev, &fi, nullptr, &fence);
+    VkFence fence = VK_NULL_HANDLE;
+    r = d.vkCreateFence(dev, &fi, nullptr, &fence);
+    if (r != VK_SUCCESS) {
+      d.vkFreeCommandBuffers(dev, pool, 1, &cb);
+      if (err) *err = "vkCreateFence: " + vkr(r);
+      return false;
+    }
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
@@ -535,6 +563,7 @@ class Gpu {
       if (err) *err = "VK_ANDROID_external_memory_android_hardware_buffer not enabled";
       return false;
     }
+    const size_t dataBytes = bytes;
     bytes = std::max<size_t>(16, (bytes + 3) & ~size_t(3));
     AHardwareBuffer_Desc desc{};
     desc.width = uint32_t(bytes);
@@ -554,7 +583,7 @@ class Gpu {
       return false;
     }
     std::memset(p, 0, bytes);
-    std::memcpy(p, data, bytes);
+    std::memcpy(p, data, dataBytes);  // the source holds dataBytes; the tail stays zero
     AHardwareBuffer_unlock(ahb, nullptr);
     b.ahb = ahb;
 
@@ -768,7 +797,8 @@ class VkExecution final : public Execution {
       if (d.vkCreateQueryPool(g.dev, &qi, nullptr, &qp_) != VK_SUCCESS) hasTs_ = false;
     }
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    d.vkCreateFence(g.dev, &fi, nullptr, &fence_);
+    r = d.vkCreateFence(g.dev, &fi, nullptr, &fence_);
+    if (r != VK_SUCCESS) { fence_ = VK_NULL_HANDLE; if (err) *err = "vkCreateFence: " + vkr(r); return false; }
 
     // ---- record the (re-submittable) command buffer ----
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -901,6 +931,13 @@ class VulkanBackend final : public Backend {
     if (!info_.available) info_.note = "maxComputeWorkGroupInvocations < 256";
     auto& dt = info_.detail;
     dt["device_type"] = pr.deviceType < 5 ? types[pr.deviceType] : "other";
+    switch (pr.deviceType) {
+      case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: info_.deviceClass = "gpu"; break;
+      case VK_PHYSICAL_DEVICE_TYPE_CPU: info_.deviceClass = "cpu"; break;
+      default: info_.deviceClass = "other"; break;
+    }
     dt["memory_model"] = gpu_->uma() ? "unified (host-visible device memory, no staging)" : "discrete (device-local + staging)";
     dt["max_workgroup_invocations"] = std::to_string(pr.limits.maxComputeWorkGroupInvocations);
     dt["max_shared_memory_bytes"] = std::to_string(pr.limits.maxComputeSharedMemorySize);
@@ -949,9 +986,23 @@ class VulkanBackend final : public Backend {
 
 }  // namespace
 
+namespace {
+// One VkInstance per process. The instance is never destroyed (see ~Runtime), so creating a new
+// one on every discovery/run would leak an instance and its ICD state each time.
+std::shared_ptr<Runtime> sharedRuntime() {
+  static std::mutex mu;
+  static std::shared_ptr<Runtime> rt;
+  std::lock_guard<std::mutex> lk(mu);
+  if (rt) return rt;
+  auto fresh = std::make_shared<Runtime>();
+  if (fresh->init()) rt = fresh;  // a failure is retried on the next discovery
+  return fresh;
+}
+}  // namespace
+
 void discoverVulkan(std::vector<std::unique_ptr<Backend>>& out) {
-  auto rt = std::make_shared<Runtime>();
-  if (!rt->init()) {
+  auto rt = sharedRuntime();
+  if (!rt->error.empty() || rt->phys.empty()) {
     BackendInfo i;
     i.id = "vulkan";
     i.api = "Vulkan compute (SPIR-V)";

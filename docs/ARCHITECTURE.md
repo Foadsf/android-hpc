@@ -40,6 +40,21 @@ This page maps it to code.
    zero-copy is only reported if the import call succeeded.
 5. **GPU work is not under-dispatched.** Reductions use up to 256 workgroups x 256 threads; matrix
    kernels cover the whole grid with bounds checks.
+6. **Device timers are cross-checked.** A device-side time is used only if every sample is consistent
+   with the host wall time of the same blocking run (`plausibleDeviceTime` in `bench.cpp`, unit-tested).
+7. **Workgroup shapes follow the driver.** GLES reads `GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS`; OpenCL
+   reads `CL_KERNEL_WORK_GROUP_SIZE` per compiled kernel and rebuilds with a smaller tile if needed
+   (exercised in CI by the `opencl_small_workgroup_fallback` test).
+8. **One version.** `project(... VERSION)` in the root `CMakeLists.txt` feeds the native report,
+   `hpc_cli` and the APK `versionName`.
+
+## App
+
+`app/` is plain `android.app.Activity` code, no AndroidX: `MainActivity` (controller), `Ui` (themed
+view factory; light/dark colours in `res/values*/colors.xml`, 48 dp minimum touch targets),
+`ReportRenderer` (report JSON to cards and bar charts), `BenchSession` (run state that outlives an
+Activity recreation), `DebugLog` (fsynced log and crash quarantine). `app/src/test` holds Robolectric
+UI tests that render a real host report and write screenshots to `app/build/ui-screenshots`.
 
 ## Memory model
 

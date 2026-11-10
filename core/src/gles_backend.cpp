@@ -413,6 +413,14 @@ void discoverGles(std::vector<std::unique_ptr<Backend>>& out) {
   info.device = safeGlString(GL_RENDERER);
   info.vendor = safeGlString(GL_VENDOR);
   info.driver = safeGlString(GL_VERSION);
+  {
+    // Software GL implementations run on the CPU; everything else is a GPU (vendor-neutral check).
+    std::string lower = info.device;
+    for (char& ch : lower) ch = char(ch >= 'A' && ch <= 'Z' ? ch - 'A' + 'a' : ch);
+    const bool software = lower.find("swiftshader") != std::string::npos || lower.find("llvmpipe") != std::string::npos ||
+                          lower.find("softpipe") != std::string::npos || lower.find("software") != std::string::npos;
+    info.deviceClass = software ? "cpu" : "gpu";
+  }
   HPC_LOGI("[GLES] context ES %d.%d | renderer='%s' | vendor='%s' | version='%s'",
            int(maj), int(min), info.device.c_str(), info.vendor.c_str(), info.driver.c_str());
   if (maj < 3 || (maj == 3 && min < 1)) {

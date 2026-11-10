@@ -24,6 +24,16 @@ struct BenchConfig {
 
 uint32_t presetSize(const std::string& preset, Kernel k);
 
+// A filter selects a backend by exact id ("opencl:1") or by family ("vulkan" selects vulkan:0,
+// vulkan:1, ...). A bare string prefix does not match: "opencl:1" must not select "opencl:10".
+bool backendMatches(const std::string& id, const std::vector<std::string>& filters);
+
+// A device-side timer sample is accepted only if it is physically consistent with the
+// host-observed time of the same blocking run: not longer than it (small allowance for
+// clock-domain jitter) and not 50x shorter. The second rule catches drivers whose timer does not
+// cover compute work (both Mali GL drivers tested return ~0.2-2 us for multi-ms dispatches).
+bool plausibleDeviceTime(double devMs, double wallMs);
+
 struct KernelResult {
   std::string backendId, api, device;
   bool genuine = true;
@@ -32,7 +42,8 @@ struct KernelResult {
   bool ran = false;        // false: prepare/run failed (see error)
   std::string error;
   double prepareMs = 0;
-  Stats wallMs, devMs;     // devMs.count == 0 when the API gave no device timing
+  Stats wallMs, devMs;     // devMs.count == 0 when the API gave no (plausible) device timing
+  size_t devRejected = 0;  // device-timer samples discarded as inconsistent with wall time
   double gflops = 0, gbps = 0;  // from device median if available, else wall median
   std::string timeBasis;   // "device" or "wall"
   bool verified = false;
@@ -42,7 +53,7 @@ struct KernelResult {
 
 struct HeteroResult {
   bool ran = false;
-  std::string error, gpuId, kernel = "sgemm", size;
+  std::string error, gpuId, gpuDevice, kernel = "sgemm", size;
   uint32_t cpuRows = 0, gpuRows = 0;
   Stats wallMs;
   double cpuAloneMs = 0, gpuAloneMs = 0, speedupVsBest = 0;

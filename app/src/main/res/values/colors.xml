@@ -1,4 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 <resources>
     <color name="ic_background">#102A43</color>
+
+    <!-- Light theme palette. Text/background pairs meet WCAG AA contrast. -->
+    <color name="bg">#F3F5F9</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="surface_variant">#EEF1F6</color>
+    <color name="outline">#DFE3EB</color>
+    <color name="on_surface">#141922</color>
+    <color name="on_surface_variant">#566072</color>
+    <color name="primary">#3451D1</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="primary_container">#E2E8FF</color>
+    <color name="on_primary_container">#14257A</color>
+    <color name="success">#1B7F3B</color>
+    <color name="success_container">#E3F3E8</color>
+    <color name="error">#B3261E</color>
+    <color name="error_container">#FBE7E5</color>
+    <color name="warning">#7A5200</color>
+    <color name="warning_container">#FFF1CC</color>
+    <color name="track">#E8EBF2</color>
+
+    <!-- Backend families (bars). Mid tones that read on light and dark surfaces. -->
+    <color name="fam_cpu">#0F9AA8</color>
+    <color name="fam_vulkan">#E0533F</color>
+    <color name="fam_opencl">#7A5CFA</color>
+    <color name="fam_gles">#E99A24</color>
+    <color name="fam_nnapi">#D2509A</color>
+    <color name="fam_other">#8792A6</color>
 </resources>

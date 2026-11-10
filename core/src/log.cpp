@@ -23,6 +23,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -90,6 +91,7 @@ void writeAllFd(int fd, const char* buf, size_t len, bool doSync) {
     int w = _write(fd, buf + off, unsigned(len - off));
 #else
     ssize_t w = write(fd, buf + off, len - off);
+    if (w < 0 && errno == EINTR) continue;
 #endif
     if (w <= 0) break;
     off += size_t(w);
@@ -124,6 +126,19 @@ const char* levelTag(LogLevel l) {
 //    last breadcrumb.
 alignas(16) uint8_t gAltStack[64 * 1024];
 std::atomic<bool> gHandlersInstalled{false};
+constexpr int kCrashSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
+struct sigaction gPrevActions[sizeof(kCrashSignals) / sizeof(kCrashSignals[0])];
+
+// Put back whatever handler was installed before ours (on Android: debuggerd's, which writes
+// the tombstone that `adb logcat -b crash` shows). Async-signal-safe: sigaction only.
+void restorePreviousHandler(int sig) {
+  for (size_t i = 0; i < sizeof(kCrashSignals) / sizeof(kCrashSignals[0]); ++i)
+    if (kCrashSignals[i] == sig) {
+      sigaction(sig, &gPrevActions[i], nullptr);
+      return;
+    }
+  signal(sig, SIG_DFL);
+}
 
 struct CrashBuf {
   char data[4096];
@@ -247,8 +262,11 @@ void crashSignalHandler(int sig, siginfo_t* info, void* /*ucontext*/) {
   }
   writeAllFd(STDERR_FILENO, cb.data, cb.len, false);
 
-  // SA_RESETHAND restored the default disposition; re-raise so the OS generates a tombstone.
-  raise(sig);
+  // Chain to the previous handler instead of SIG_DFL, so Android's debuggerd still produces a
+  // tombstone. A fault raised by an instruction (si_code > 0) re-executes on return and hits the
+  // restored handler with the original context; a signal sent by abort()/kill is re-raised.
+  restorePreviousHandler(sig);
+  if (!info || info->si_code <= 0 || sig == SIGABRT) raise(sig);
 }
 #endif  // !defined(_WIN32)
 
@@ -337,11 +355,13 @@ void installCrashHandlers() {
   struct sigaction sa{};
   sa.sa_sigaction = crashSignalHandler;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;  // no SA_RESETHAND: the handler restores the previous one
 
-  const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
-  for (int s : sigs) {
-    sigaction(s, &sa, nullptr);
+  for (size_t i = 0; i < sizeof(kCrashSignals) / sizeof(kCrashSignals[0]); ++i) {
+    if (sigaction(kCrashSignals[i], &sa, &gPrevActions[i]) != 0) {
+      gPrevActions[i] = {};
+      gPrevActions[i].sa_handler = SIG_DFL;
+    }
   }
 #endif
 }
@@ -349,11 +369,12 @@ void installCrashHandlers() {
 void logPrint(LogLevel level, const char* fmt, ...) {
   const bool verb = gVerbose.load();
   if (level == LogLevel::Verbose && !verb) return;
+  if (!fmt) return;
 
   char msg[1536];
   va_list ap;
   va_start(ap, fmt);
-  std::vsnprintf(msg, sizeof(msg), fmt ? fmt : "", ap);
+  std::vsnprintf(msg, sizeof(msg), fmt, ap);
   va_end(ap);
 
   const std::string clean = sanitizeAscii(msg, sizeof(msg) - 1);
