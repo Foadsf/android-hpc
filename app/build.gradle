@@ -76,6 +76,10 @@ android {
         // UI smoke tests run the real Activity on Robolectric's Android framework (no device).
         unitTests.includeAndroidResources = true
         unitTests.all {
+            testLogging {
+                events 'failed'
+                exceptionFormat 'full'  // show assertion messages in the CI log, not just the line
+            }
             systemProperty 'robolectric.graphicsMode', 'NATIVE'
             systemProperty 'hpc.screenshotDir', "${buildDir}/ui-screenshots"
             // Robolectric downloads its Android framework jar from Maven Central at test time;

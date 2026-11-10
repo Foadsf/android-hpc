@@ -75,16 +75,24 @@ public class MainActivityUiTest {
         return false;
     }
 
-    /** Every visible clickable view must be at least 48 dp tall. */
-    private static void assertTouchTargets(View v, float density) {
+    /** Every visible clickable view must be at least 48 dp tall; the message lists all offenders. */
+    private static void assertTouchTargets(View root, float density) {
+        StringBuilder bad = new StringBuilder();
+        collectSmallTargets(root, density, bad);
+        assertTrue("touch targets under 48 dp:" + bad, bad.length() == 0);
+    }
+
+    private static void collectSmallTargets(View v, float density, StringBuilder bad) {
         if (v.getVisibility() != View.VISIBLE) return;
-        if (v.isClickable() && v.getHeight() > 0) {
-            assertTrue("touch target too small (" + v.getHeight() / density + " dp): " + v,
-                    v.getHeight() >= Math.round(48 * density) - 1);
+        if (v.isClickable() && v.getHeight() > 0 && v.getHeight() < Math.round(48 * density) - 1) {
+            bad.append("\n  ").append(v.getClass().getSimpleName()).append(' ')
+                    .append(v.getHeight() / density).append(" dp");
+            if (v instanceof TextView) bad.append(" \"").append(((TextView) v).getText()).append('"');
+            if (v.getParent() instanceof View) bad.append(" in ").append(((View) v.getParent()).getClass().getSimpleName());
         }
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); ++i) assertTouchTargets(g.getChildAt(i), density);
+            for (int i = 0; i < g.getChildCount(); ++i) collectSmallTargets(g.getChildAt(i), density, bad);
         }
     }
 
